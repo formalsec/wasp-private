@@ -119,10 +119,11 @@ exception Unsatisfiable
 
 let lines_to_ignore = ref 0
 
-let assumes     = ref []
-let step_cnt    = ref 0
-let iterations  = ref 1
-let incomplete  = ref false
+let assumes    = ref []
+let step_cnt   = ref 0
+let solver_cnt = ref 0
+let iterations = ref 1
+let incomplete = ref false
 
 (* Time statistics *)
 let solver_time = ref 0.
@@ -451,6 +452,7 @@ let rec sym_step (c : sym_config) : sym_config =
               let c = Option.map negate_relop (to_constraint ex') in
               let pc' = Option.map_default (fun a -> a :: pc) pc c in
               let assertion = Formula.to_formula (!assumes @ pc') in
+              solver_cnt := !solver_cnt + 1;
               let model = time_call Z3Encoding2.check_sat_core assertion solver_time in
               match model with
               | None   -> []
@@ -481,6 +483,7 @@ let rec sym_step (c : sym_config) : sym_config =
           vs', [Interrupt (AsmFail !assumes) @@ e.at], logic_env, pc, mem
         ) else (
           let assertion = Formula.to_formula (!assumes @ pc) in
+          solver_cnt := !solver_cnt + 1;
           let model = time_call Z3Encoding2.check_sat_core assertion solver_time in
           let vs'', es' = match model with
             | None -> vs', [Interrupt (AsmFail !assumes) @@ e.at]
@@ -808,6 +811,7 @@ let set_timeout (time_limit : int) : unit =
       "\"loop_time\" : \""         ^ (string_of_float loop_time)    ^ "\", " ^
       "\"solver_time\" : \""       ^ (string_of_float !solver_time) ^ "\", " ^
       "\"paths_explored\" : "      ^ (string_of_int !iterations)    ^ ", " ^
+      "\"solver_counter\" : "      ^ (string_of_int !solver_cnt)    ^ ", " ^
       "\"instruction_counter\" : " ^ (string_of_int !step_cnt)      ^ ", " ^
       "\"incomplete\" : "          ^ (string_of_bool !incomplete)   ^
     "}"
@@ -889,6 +893,7 @@ let sym_invoke' (func : func_inst) (vs : sym_value list) : sym_value list =
       debug ("\n\n" ^ delim ^ " GLOBAL PATH CONDITION " ^ delim ^ "\n" ^
             (Formula.pp_to_string formula) ^ "\n" ^ (String.make 28 '$') ^ "\n");
 
+    solver_cnt := !solver_cnt + 1;
     let start = Sys.time () in
     let opt_model = Z3Encoding2.check_sat_core formula in
     let curr_time = (Sys.time ()) -. start in
@@ -985,6 +990,7 @@ let sym_invoke' (func : func_inst) (vs : sym_value list) : sym_value list =
     "\"loop_time\" : \""         ^ (string_of_float loop_time)    ^ "\", " ^
     "\"solver_time\" : \""       ^ (string_of_float !solver_time) ^ "\", " ^
     "\"paths_explored\" : "      ^ (string_of_int !iterations)    ^ ", " ^
+    "\"solver_counter\" : "      ^ (string_of_int !solver_cnt)    ^ ", " ^
     "\"instruction_counter\" : " ^ (string_of_int !step_cnt)      ^ ", " ^
     "\"incomplete\" : "          ^ (string_of_bool !incomplete)   ^
   "}"
