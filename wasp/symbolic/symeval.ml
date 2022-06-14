@@ -226,6 +226,13 @@ let fresh_sth (name : string) : (unit -> string) =
 let fresh_sym_var : (unit -> string) =
   fresh_sth "#DVAR"
 
+let record_branch (path : path_conditions) : unit =
+  if (List.length path) > 0 then begin
+    let path_str = Formula.(to_string (to_formula path)) in
+    if not (Hashtbl.mem execution_tree path_str) then
+      Hashtbl.add execution_tree path_str true
+  end
+
 let push_new_path (path : path_conditions) : unit =
   if (List.length path) > 0 then begin
     let path_str = Formula.(to_string (to_formula path)) in
@@ -263,11 +270,13 @@ let rec sym_step (c : sym_config) : sym_config =
 
       | If (ts, es1, es2), (I32 0l, ex) :: vs' ->
         let pc' = add_constraint ex pc true in
+        record_branch pc';
         push_new_path (add_constraint ex pc false);
         vs', [SPlain (Block (ts, es2)) @@ e.at], logic_env, pc', mem
 
       | If (ts, es1, es2), (I32 i, ex) :: vs' ->
         let pc' = add_constraint ex pc false in
+        record_branch pc';
         push_new_path (add_constraint ex pc true);
         vs', [SPlain (Block (ts, es1)) @@ e.at], logic_env, pc', mem
 
@@ -277,11 +286,13 @@ let rec sym_step (c : sym_config) : sym_config =
       | BrIf x, (I32 0l, ex) :: vs' ->
         (* Negate expression because it is false *)
         let pc' = add_constraint ex pc true in
+        record_branch pc';
         push_new_path (add_constraint ex pc false);
         vs', [], logic_env, pc', mem
 
       | BrIf x, (I32 i, ex) :: vs' ->
         let pc' = add_constraint ex pc false in
+        record_branch pc';
         push_new_path (add_constraint ex pc true);
         vs', [SPlain (Br x) @@ e.at], logic_env, pc', mem
 
@@ -309,11 +320,13 @@ let rec sym_step (c : sym_config) : sym_config =
 
       | Select, (I32 0l, ex) :: v2 :: v1 :: vs' ->
         let pc' = add_constraint ex pc true in
+        record_branch pc';
         push_new_path (add_constraint ex pc false);
         v2 :: vs', [], logic_env, pc', mem
 
       | Select, (I32 i, ex) :: v2 :: v1 :: vs' ->
         let pc' = add_constraint ex pc false in
+        record_branch pc';
         push_new_path (add_constraint ex pc true);
         v1 :: vs', [], logic_env, pc', mem
 
@@ -484,6 +497,7 @@ let rec sym_step (c : sym_config) : sym_config =
           let c = Option.map negate_relop cond in
           let pc' = Option.map_default (fun a -> a :: pc) pc c in
           Option.map_default (fun a ->
+            record_branch pc';
             push_new_path (add_constraint a pc false)) () cond;
           vs', [Interrupt (AsmFail pc') @@ e.at], logic_env, pc', mem
         ) else (
