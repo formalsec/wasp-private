@@ -122,6 +122,9 @@ let loop_start = ref 0.
 
 let chunk_table = Hashtbl.create 512
 
+let execution_tree = Hashtbl.create 512
+let to_explore : (sym_expr list) Stack.t = Stack.create ()
+
 (* Helpers *)
 let debug str = if !Flags.trace then print_endline str
 let time_call f args acc =
@@ -223,6 +226,15 @@ let fresh_sth (name : string) : (unit -> string) =
 let fresh_sym_var : (unit -> string) =
   fresh_sth "#DVAR"
 
+let push_new_path (path : path_conditions) : unit =
+  if (List.length path) > 1 then begin
+    let path_str = Formula.(to_string (to_formula path)) in
+    if not (Hashtbl.mem execution_tree path_str) then begin
+      Hashtbl.add execution_tree path_str true;
+      Stack.push path to_explore
+    end
+  end
+
 (*  Symbolic step  *)
 let rec sym_step (c : sym_config) : sym_config =
   step_cnt := !step_cnt + 1;
@@ -250,29 +262,28 @@ let rec sym_step (c : sym_config) : sym_config =
         vs, [SLabel (0, [e' @@ e.at], ([], List.map plain es')) @@ e.at], logic_env, pc, mem
 
       | If (ts, es1, es2), (I32 0l, ex) :: vs' ->
-        let pc = add_constraint ex pc true in
-        (*Printf.printf ("\n\n###### Entered IF, with 0 on top of stack. ######\nPath conditions are now:\n %s\n#################################################\n\n")   (Symvalue.str_pc ([v'] @ pc));*)
-        vs', [SPlain (Block (ts, es2)) @@ e.at], logic_env, pc, mem
+        let pc' = add_constraint ex pc true in
+        push_new_path (add_constraint ex pc false);
+        vs', [SPlain (Block (ts, es2)) @@ e.at], logic_env, pc', mem
 
       | If (ts, es1, es2), (I32 i, ex) :: vs' ->
-        let pc = add_constraint ex pc false in
-        (*Printf.printf ("\n\n###### Entered IF, with !=0 on top of stack. ######\nPath conditions are now:\n %s\n##################################################\n\n")   (Symvalue.str_pc ([v'] @ pc));*)
-        vs', [SPlain (Block (ts, es1)) @@ e.at], logic_env, pc, mem
+        let pc' = add_constraint ex pc false in
+        push_new_path (add_constraint ex pc true);
+        vs', [SPlain (Block (ts, es1)) @@ e.at], logic_env, pc', mem
 
       | Br x, vs ->
         [], [SBreaking (x.it, vs) @@ e.at], logic_env, pc, mem
 
       | BrIf x, (I32 0l, ex) :: vs' ->
         (* Negate expression because it is false *)
-        let pc = add_constraint ex pc true in
-        (*Printf.printf ("\n\n###### Entered BRIF, with 0 on top of stack @ (%s) ######\nPath conditions are now:\n %s\n#################################################\n\n") (Source.string_of_region e.at) (Symvalue.pp_string_of_pc
-         (to_add @ pc));*)
-        vs', [], logic_env, pc, mem
+        let pc' = add_constraint ex pc true in
+        push_new_path (add_constraint ex pc false);
+        vs', [], logic_env, pc', mem
 
       | BrIf x, (I32 i, ex) :: vs' ->
-        let pc = add_constraint ex pc false in
-        (*Printf.printf ("\n\n###### Entered IF, with !=0 on top of stack @ (%s) ######\nPath conditions are now:\n %s\n##################################################\n\n") (Source.string_of_region e.at) (Symvalue.pp_string_of_pc (to_add @ pc));*)
-        vs', [SPlain (Br x) @@ e.at], logic_env, pc, mem
+        let pc' = add_constraint ex pc false in
+        push_new_path (add_constraint ex pc true);
+        vs', [SPlain (Br x) @@ e.at], logic_env, pc', mem
 
       | BrTable (xs, x), (I32 i, _) :: vs' when I32.ge_u i (Lib.List32.length xs) ->
         vs', [SPlain (Br x) @@ e.at], logic_env, pc, mem
@@ -297,12 +308,14 @@ let rec sym_step (c : sym_config) : sym_config =
         vs', [], logic_env, pc, mem
 
       | Select, (I32 0l, ex) :: v2 :: v1 :: vs' ->
-        let pc = add_constraint ex pc true in
-        v2 :: vs', [], logic_env, pc, mem
+        let pc' = add_constraint ex pc true in
+        push_new_path (add_constraint ex pc false);
+        v2 :: vs', [], logic_env, pc', mem
 
       | Select, (I32 i, ex) :: v2 :: v1 :: vs' ->
-        let pc = add_constraint ex pc false in
-        v1 :: vs', [], logic_env, pc , mem
+        let pc' = add_constraint ex pc false in
+        push_new_path (add_constraint ex pc true);
+        v1 :: vs', [], logic_env, pc', mem
 
       | LocalGet x, vs ->
         !(local frame x) :: vs, [], logic_env, pc, mem
@@ -470,6 +483,8 @@ let rec sym_step (c : sym_config) : sym_config =
         if not !Flags.smt_assume then (
           let c = Option.map negate_relop cond in
           let pc' = Option.map_default (fun a -> a :: pc) pc c in
+          Option.map_default (fun a ->
+            push_new_path (add_constraint a pc false)) () cond;
           vs', [Interrupt (AsmFail pc') @@ e.at], logic_env, pc', mem
         ) else (
           let pc' = Option.map_default (fun a -> a :: pc) pc cond in
@@ -820,6 +835,68 @@ let write_test_case out_dir fmt test_data : unit =
   Io.save_file (Printf.sprintf fmt out_dir (i ())) test_data
 
 let sym_invoke' (func : func_inst) (vs : sym_value list) : sym_value list =
+  set_timeout !Flags.timeout;
+  let at = match func with Func.AstFunc (_, _, f) -> f.at | _ -> no_region in
+  let inst = try Option.get (Func.get_inst func) with Invalid_argument s ->
+    Crash.error at ("sym_invoke: " ^ s) in
+  let c = ref (sym_config empty_module_inst (List.rev vs) [SInvoke func @@ at]
+    !inst.sym_memory) in
+  (* Prepare output *)
+  let test_suite = Filename.concat !Flags.output "test_suite" in
+  Io.safe_mkdir test_suite;
+  (* Initial memory config *)
+  let initial_memory = Symmem2.to_list !inst.sym_memory in
+  let initial_globals = Global.contents !inst.globals in
+  (* Assume constraints are stored here *)
+  let initial_sym_code = !c.sym_code in
+  let rec concolic_loop i = 
+    let {logic_env; _} = try sym_eval !c with
+      | InstrLimit conf -> failwith "TODO: Instruction limit reached."
+      | AssumeFail (conf, cons) -> conf
+      | AssertFail (conf, at, wit) -> failwith "TODO: assert failure."
+      | Trap (at, msg) -> Trap.error at msg
+      | e -> raise e in
+    if Stack.is_empty to_explore then true
+    else begin
+      let npc = ref (Formula.to_formula (Stack.pop to_explore)) in
+      let delim = String.make 6 '$' in
+      debug ("\n\n" ^ delim ^ " PATH CONDITIONS BEFORE Z3 " ^ delim ^
+        "\n" ^ (Formula.pp_to_string !npc) ^ "\n" ^ (String.make 38 '$'));
+      let opt_model = ref (Z3Encoding2.check_sat_core !npc) in
+      while not (Option.is_some !opt_model) do
+        if Stack.is_empty to_explore then raise Unsatisfiable;
+        npc := Formula.to_formula (Stack.pop to_explore);
+        debug ("\n\n" ^ delim ^ " PATH CONDITIONS BEFORE Z3 " ^ delim ^
+          "\n" ^ (Formula.pp_to_string !npc) ^ "\n" ^ (String.make 38 '$'));
+        opt_model := Z3Encoding2.check_sat_core !npc
+      done;
+      (* update c *)
+      let model = Option.get !opt_model in
+      let li32 = Logicenv.get_vars_by_type I32Type logic_env in
+      let li64 = Logicenv.get_vars_by_type I64Type logic_env in
+      let lf32 = Logicenv.get_vars_by_type F32Type logic_env in
+      let lf64 = Logicenv.get_vars_by_type F64Type logic_env in
+      (* 3. Obtain a concrete model for the global path condition *)
+      let binds = Z3Encoding2.lift_z3_model model li32 li64 lf32 lf64 in
+      Hashtbl.reset chunk_table;
+      Logicenv.reset logic_env;
+      Logicenv.init logic_env binds;
+      Symmem2.clear !c.sym_mem;
+      Symmem2.init !c.sym_mem initial_memory;
+      Instance.set_globals !inst initial_globals;
+      c := {!c with sym_budget = 100000; sym_code = initial_sym_code; path_cond = []};
+      concolic_loop (i + 1)
+    end
+  in
+  let _ = try concolic_loop 1 with
+    | Unsatisfiable ->
+      debug "Model is no longer satisfiable. All paths have been verified.\n";
+      true in
+  let (vs, _) = !c.sym_code in
+  try List.rev vs with Stack_overflow ->
+    Exhaustion.error at "call stack exhausted"
+
+let concolic_execute0 (func : func_inst) (vs : sym_value list) : sym_value list =
   set_timeout !Flags.timeout;
   let at = match func with Func.AstFunc (_, _, f) -> f.at | _ -> no_region in
   let inst = try Option.get (Func.get_inst func) with Invalid_argument s ->
