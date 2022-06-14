@@ -227,7 +227,7 @@ let fresh_sym_var : (unit -> string) =
   fresh_sth "#DVAR"
 
 let push_new_path (path : path_conditions) : unit =
-  if (List.length path) > 1 then begin
+  if (List.length path) > 0 then begin
     let path_str = Formula.(to_string (to_formula path)) in
     if not (Hashtbl.mem execution_tree path_str) then begin
       Hashtbl.add execution_tree path_str true;
@@ -851,24 +851,38 @@ let sym_invoke' (func : func_inst) (vs : sym_value list) : sym_value list =
   let initial_sym_code = !c.sym_code in
   let rec concolic_loop i = 
     let {logic_env; _} = try sym_eval !c with
-      | InstrLimit conf -> failwith "TODO: Instruction limit reached."
+      | InstrLimit conf ->
+        let {logic_env; _} = conf in
+        write_test_case test_suite "%s/test_%05d.json" Logicenv.(to_json (to_list logic_env));
+        raise Unsatisfiable
       | AssumeFail (conf, cons) -> conf
-      | AssertFail (conf, at, wit) -> failwith "TODO: assert failure."
+      | AssertFail (conf, at, wit) -> 
+        debug ("\n" ^ (string_of_region at) ^ ": Assertion Failure\n" ^ wit);
+        raise (AssertFail (conf, at, wit))
       | Trap (at, msg) -> Trap.error at msg
       | e -> raise e in
-    if Stack.is_empty to_explore then true
+    write_test_case test_suite "%s/test_%05d.json" Logicenv.(to_json (to_list logic_env));
+    if Stack.is_empty to_explore then true, "{}", "[]"
     else begin
       let npc = ref (Formula.to_formula (Stack.pop to_explore)) in
       let delim = String.make 6 '$' in
       debug ("\n\n" ^ delim ^ " PATH CONDITIONS BEFORE Z3 " ^ delim ^
         "\n" ^ (Formula.pp_to_string !npc) ^ "\n" ^ (String.make 38 '$'));
+      solver_cnt := !solver_cnt + 1;
+      let start = Sys.time () in
       let opt_model = ref (Z3Encoding2.check_sat_core !npc) in
+      let curr_time = (Sys.time ()) -. start in
+      solver_time := !solver_time +. curr_time;
       while not (Option.is_some !opt_model) do
         if Stack.is_empty to_explore then raise Unsatisfiable;
         npc := Formula.to_formula (Stack.pop to_explore);
         debug ("\n\n" ^ delim ^ " PATH CONDITIONS BEFORE Z3 " ^ delim ^
           "\n" ^ (Formula.pp_to_string !npc) ^ "\n" ^ (String.make 38 '$'));
-        opt_model := Z3Encoding2.check_sat_core !npc
+        solver_cnt := !solver_cnt + 1;
+        let start = Sys.time () in
+        opt_model := Z3Encoding2.check_sat_core !npc;
+        let curr_time = (Sys.time ()) -. start in
+        solver_time := !solver_time +. curr_time;
       done;
       (* update c *)
       let model = Option.get !opt_model in
@@ -885,13 +899,48 @@ let sym_invoke' (func : func_inst) (vs : sym_value list) : sym_value list =
       Symmem2.init !c.sym_mem initial_memory;
       Instance.set_globals !inst initial_globals;
       c := {!c with sym_budget = 100000; sym_code = initial_sym_code; path_cond = []};
+      iterations := !iterations + 1;
       concolic_loop (i + 1)
     end
   in
-  let _ = try concolic_loop 1 with
+  loop_start := Sys.time ();
+  let spec, reason, wit = try concolic_loop 1 with
     | Unsatisfiable ->
       debug "Model is no longer satisfiable. All paths have been verified.\n";
-      true in
+      true, "{}", "[]"
+    | AssertFail (_, r, wit) ->
+      incomplete := true;
+      let reason = "{" ^
+        "\"type\" : \""    ^ "Assertion Failure" ^ "\", " ^
+        "\"line\" : \"" ^ (Source.string_of_pos r.left ^
+        (if r.right = r.left then "" else "-" ^ string_of_pos r.right)) ^ "\"" ^
+      "}" in
+      write_test_case test_suite "%s/witness_%05d.json" wit;
+      false, reason, wit
+    | BugException (b, r, wit) ->
+      incomplete := true;
+      let reason = "{" ^
+        "\"type\" : \""    ^ (string_of_bug b) ^ "\", " ^
+        "\"line\" : \"" ^ (Source.string_of_pos r.left ^
+        (if r.right = r.left then "" else "-" ^ string_of_pos r.right)) ^ "\"" ^
+      "}" in
+      write_test_case test_suite "%s/witness_%05d.json" wit;
+      false, reason, wit
+    | e -> raise e
+  in
+  let loop_time = (Sys.time ()) -. !loop_start in
+  let fmt_str = "{" ^
+    "\"specification\": "        ^ (string_of_bool spec)          ^ ", " ^
+    "\"reason\" : "              ^ reason                         ^ ", " ^
+    "\"witness\" : "             ^ wit                            ^ ", " ^
+    "\"loop_time\" : \""         ^ (string_of_float loop_time)    ^ "\", " ^
+    "\"solver_time\" : \""       ^ (string_of_float !solver_time) ^ "\", " ^
+    "\"paths_explored\" : "      ^ (string_of_int !iterations)    ^ ", " ^
+    "\"solver_counter\" : "      ^ (string_of_int !solver_cnt)    ^ ", " ^
+    "\"instruction_counter\" : " ^ (string_of_int !step_cnt)      ^ ", " ^
+    "\"incomplete\" : "          ^ (string_of_bool !incomplete)   ^
+  "}"
+  in Io.save_file (Filename.concat !Flags.output "report.json") fmt_str;
   let (vs, _) = !c.sym_code in
   try List.rev vs with Stack_overflow ->
     Exhaustion.error at "call stack exhausted"
