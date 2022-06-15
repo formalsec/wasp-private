@@ -113,7 +113,7 @@ let lines_to_ignore = ref 0
 let assumes    = ref []
 let step_cnt   = ref 0
 let solver_cnt = ref 0
-let iterations = ref 1
+let iterations = ref 0
 let incomplete = ref false
 
 (* Time statistics *)
@@ -127,11 +127,20 @@ let to_explore : (sym_expr list) Stack.t = Stack.create ()
 
 (* Helpers *)
 let debug str = if !Flags.trace then print_endline str
+
 let time_call f args acc =
   let start = Sys.time () in
   let ret = f args in
   acc := !acc +. ((Sys.time ()) -. start);
   ret
+
+let timed_check_sat formula =
+  let start = Sys.time () in
+  let opt_model = Z3Encoding2.check_sat_core formula in
+  let delta = (Sys.time ()) -. start in
+  solver_time := !solver_time +. delta;
+  solver_cnt := !solver_cnt + 1;
+  opt_model
 
 let string_of_bug : (bug -> string) = function
   | Overflow -> "Overflow"
@@ -503,8 +512,7 @@ let rec sym_step (c : sym_config) : sym_config =
         ) else (
           let pc' = Option.map_default (fun a -> a :: pc) pc cond in
           let assertion = Formula.to_formula pc' in
-          solver_cnt := !solver_cnt + 1;
-          let model = time_call Z3Encoding2.check_sat_core assertion solver_time in
+          let model = timed_check_sat assertion in
           let vs'', es', pc'' = match model with
             | None -> vs', [Interrupt (AsmFail pc') @@ e.at], (Option.map_default (fun a -> a :: pc) pc (Option.map negate_relop cond))
             | Some m ->
@@ -532,6 +540,7 @@ let rec sym_step (c : sym_config) : sym_config =
               pc
           ) else Option.map_default (fun a -> a :: pc) pc cond
         in
+        record_branch pc';
         debug ">>> Assume passed. Continuing execution...";
         vs', [], logic_env, pc', mem
 
@@ -848,105 +857,91 @@ let write_test_case out_dir fmt test_data : unit =
   let i = next_int () in
   Io.save_file (Printf.sprintf fmt out_dir (i ())) test_data
 
-let sym_invoke' (func : func_inst) (vs : sym_value list) : sym_value list =
-  set_timeout !Flags.timeout;
-  let at = match func with Func.AstFunc (_, _, f) -> f.at | _ -> no_region in
-  let inst = try Option.get (Func.get_inst func) with Invalid_argument s ->
-    Crash.error at ("sym_invoke: " ^ s) in
-  let c = ref (sym_config empty_module_inst (List.rev vs) [SInvoke func @@ at]
-    !inst.sym_memory) in
-  (* Prepare output *)
-  let test_suite = Filename.concat !Flags.output "test_suite" in
-  Io.safe_mkdir test_suite;
-  (* Initial memory config *)
-  let initial_memory = Symmem2.to_list !inst.sym_memory in
-  let initial_globals = Global.contents !inst.globals in
-  (* Assume constraints are stored here *)
-  let initial_sym_code = !c.sym_code in
-  let rec concolic_loop i = 
+let update_config model logic_env c inst mem glob code =
+  let li32 = Logicenv.get_vars_by_type I32Type logic_env
+  and li64 = Logicenv.get_vars_by_type I64Type logic_env
+  and lf32 = Logicenv.get_vars_by_type F32Type logic_env
+  and lf64 = Logicenv.get_vars_by_type F64Type logic_env in
+  let binds = Z3Encoding2.lift_z3_model model li32 li64 lf32 lf64 in
+  Hashtbl.reset chunk_table;
+  Logicenv.reset logic_env;
+  Logicenv.init logic_env binds;
+  Symmem2.clear !c.sym_mem;
+  Symmem2.init !c.sym_mem mem;
+  Instance.set_globals !inst glob;
+  {!c with sym_budget=100000; sym_code=code; path_cond=[]}
+
+let guided_search c inst test_suite =
+  (* Save initial module configs *)
+  let init_mem = Symmem2.to_list !inst.sym_memory in
+  let init_glob = Global.contents !inst.globals in
+  let init_code = !c.sym_code in
+  let rec loop () =
+    let finish = ref false in
     let {logic_env; _} = try sym_eval !c with
-      | InstrLimit conf ->
-        let {logic_env; _} = conf in
-        write_test_case test_suite "%s/test_%05d.json" Logicenv.(to_json (to_list logic_env));
-        raise Unsatisfiable
-      | AssumeFail (conf, cons) -> conf
-      | AssertFail (conf, at, wit) -> 
-        debug ("\n" ^ (string_of_region at) ^ ": Assertion Failure\n" ^ wit);
-        raise (AssertFail (conf, at, wit))
-      | Trap (at, msg) -> Trap.error at msg
-      | e -> raise e in
-    write_test_case test_suite "%s/test_%05d.json" Logicenv.(to_json (to_list logic_env));
-    if Stack.is_empty to_explore then true, "{}", "[]"
+      | InstrLimit c' -> finish := true; c'
+      | AssumeFail (c', _) -> c'
+      | e -> raise e
+    in iterations := !iterations + 1;
+    (* Execution success, we can save inputs *)
+    let assignments = Logicenv.(to_json (to_list logic_env)) in
+    write_test_case test_suite "%s/test_%05d.json" assignments;
+    (* Check termination conditions *)
+    if ((Stack.is_empty to_explore) || !finish) then true, "{}", "[]"
     else begin
-      let npc = ref (Formula.to_formula (Stack.pop to_explore)) in
-      let delim = String.make 6 '$' in
-      debug ("\n\n" ^ delim ^ " PATH CONDITIONS BEFORE Z3 " ^ delim ^
-        "\n" ^ (Formula.pp_to_string !npc) ^ "\n" ^ (String.make 38 '$'));
-      solver_cnt := !solver_cnt + 1;
-      let start = Sys.time () in
-      let opt_model = ref (Z3Encoding2.check_sat_core !npc) in
-      let curr_time = (Sys.time ()) -. start in
-      solver_time := !solver_time +. curr_time;
+      let pc = ref (Formula.to_formula (Stack.pop to_explore)) in
+      let opt_model = ref (timed_check_sat !pc) in
       while not (Option.is_some !opt_model) do
         if Stack.is_empty to_explore then raise Unsatisfiable;
-        npc := Formula.to_formula (Stack.pop to_explore);
-        debug ("\n\n" ^ delim ^ " PATH CONDITIONS BEFORE Z3 " ^ delim ^
-          "\n" ^ (Formula.pp_to_string !npc) ^ "\n" ^ (String.make 38 '$'));
-        solver_cnt := !solver_cnt + 1;
-        let start = Sys.time () in
-        opt_model := Z3Encoding2.check_sat_core !npc;
-        let curr_time = (Sys.time ()) -. start in
-        solver_time := !solver_time +. curr_time;
+        pc := Formula.to_formula (Stack.pop to_explore);
+        opt_model := timed_check_sat !pc
       done;
-      (* update c *)
       let model = Option.get !opt_model in
-      let li32 = Logicenv.get_vars_by_type I32Type logic_env in
-      let li64 = Logicenv.get_vars_by_type I64Type logic_env in
-      let lf32 = Logicenv.get_vars_by_type F32Type logic_env in
-      let lf64 = Logicenv.get_vars_by_type F64Type logic_env in
-      (* 3. Obtain a concrete model for the global path condition *)
-      let binds = Z3Encoding2.lift_z3_model model li32 li64 lf32 lf64 in
-      Hashtbl.reset chunk_table;
-      Logicenv.reset logic_env;
-      Logicenv.init logic_env binds;
-      Symmem2.clear !c.sym_mem;
-      Symmem2.init !c.sym_mem initial_memory;
-      Instance.set_globals !inst initial_globals;
-      c := {!c with sym_budget = 100000; sym_code = initial_sym_code; path_cond = []};
-      iterations := !iterations + 1;
-      concolic_loop (i + 1)
+      c := update_config model logic_env c inst init_mem init_glob init_code;
+      loop ()
     end
-  in
+  in 
   loop_start := Sys.time ();
-  let spec, reason, wit = try concolic_loop 1 with
-    | Unsatisfiable ->
-      debug "Model is no longer satisfiable. All paths have been verified.\n";
-      true, "{}", "[]"
+  let spec, reason, wit = try loop () with
+    | Unsatisfiable -> true, "{}", "[]"
     | AssertFail (_, r, wit) ->
-      incomplete := true;
-      let reason = "{" ^
-        "\"type\" : \""    ^ "Assertion Failure" ^ "\", " ^
-        "\"line\" : \"" ^ (Source.string_of_pos r.left ^
-        (if r.right = r.left then "" else "-" ^ string_of_pos r.right)) ^ "\"" ^
-      "}" in
-      write_test_case test_suite "%s/witness_%05d.json" wit;
-      false, reason, wit
+        incomplete := true;
+        let pos_str = Source.string_of_pos r.left ^ 
+          (if r.right = r.left then ""
+                               else "-" ^ string_of_pos r.right)
+        in
+        let reason = "{" ^
+          "\"type\" : \"" ^ "Assertion Failure" ^ "\", " ^
+          "\"line\" : \"" ^ pos_str             ^ "\"" ^
+        "}" 
+        in
+        write_test_case test_suite "%s/witness_%05d.json" wit;
+        false, reason, wit
     | BugException (b, r, wit) ->
-      incomplete := true;
-      let reason = "{" ^
-        "\"type\" : \""    ^ (string_of_bug b) ^ "\", " ^
-        "\"line\" : \"" ^ (Source.string_of_pos r.left ^
-        (if r.right = r.left then "" else "-" ^ string_of_pos r.right)) ^ "\"" ^
-      "}" in
-      write_test_case test_suite "%s/witness_%05d.json" wit;
-      false, reason, wit
+        incomplete := true;
+        let pos = Source.string_of_pos r.left ^ 
+          (if r.right = r.left then ""
+                               else "-" ^ string_of_pos r.right)
+        in
+        let reason = "{" ^
+          "\"type\" : \"" ^ (string_of_bug b) ^ "\", " ^
+          "\"line\" : \"" ^ pos               ^ "\"" ^
+        "}"
+        in
+        write_test_case test_suite "%s/witness_%05d.json" wit;
+        false, reason, wit
     | e -> raise e
   in
   let loop_time = (Sys.time ()) -. !loop_start in
+  let n_lines = List.((length !inst.types) + (length !inst.tables) +
+                      (length !inst.memories) + (length !inst.globals) +
+                      (length !inst.exports) + 1) in
+  let coverage = (Coverage.calculate_cov inst (n_lines + !lines_to_ignore)) *. 100.0 in
   let fmt_str = "{" ^
     "\"specification\": "        ^ (string_of_bool spec)          ^ ", " ^
     "\"reason\" : "              ^ reason                         ^ ", " ^
     "\"witness\" : "             ^ wit                            ^ ", " ^
+    "\"coverage\" : \""          ^ (string_of_float coverage)     ^ "\", " ^
     "\"loop_time\" : \""         ^ (string_of_float loop_time)    ^ "\", " ^
     "\"solver_time\" : \""       ^ (string_of_float !solver_time) ^ "\", " ^
     "\"paths_explored\" : "      ^ (string_of_int !iterations)    ^ ", " ^
@@ -955,31 +950,22 @@ let sym_invoke' (func : func_inst) (vs : sym_value list) : sym_value list =
     "\"incomplete\" : "          ^ (string_of_bool !incomplete)   ^
   "}"
   in Io.save_file (Filename.concat !Flags.output "report.json") fmt_str;
-  let (vs, _) = !c.sym_code in
-  try List.rev vs with Stack_overflow ->
-    Exhaustion.error at "call stack exhausted"
+  !c.sym_code
 
-let concolic_execute0 (func : func_inst) (vs : sym_value list) : sym_value list =
-  set_timeout !Flags.timeout;
-  let at = match func with Func.AstFunc (_, _, f) -> f.at | _ -> no_region in
-  let inst = try Option.get (Func.get_inst func) with Invalid_argument s ->
-    Crash.error at ("sym_invoke: " ^ s) in
-  let c = ref (sym_config empty_module_inst (List.rev vs) [SInvoke func @@ at]
-    !inst.sym_memory) in
-  (* Prepare output *)
-  let test_suite = Filename.concat !Flags.output "test_suite" in
-  Io.safe_mkdir test_suite;
+let random_search
+    (c : sym_config ref)
+    (inst : module_inst ref)
+    (test_suite : string) =
   (* Initial memory config *)
-  let initial_memory = Symmem2.to_list !inst.sym_memory in
-  let initial_globals = Global.contents !inst.globals in
-  (* Assume constraints are stored here *)
-  let finish_constraints = Constraints.create in
-  let initial_sym_code = !c.sym_code in
-  (* Concolic execution *)
+  let init_mem = Symmem2.to_list !inst.sym_memory
+  and init_glob = Global.contents !inst.globals
+  and init_code = !c.sym_code
+  and finish_constraints = Constraints.create
+  in (* Concolic execution *)
   let rec loop global_pc =
     debug ((String.make 35 '~') ^ " ITERATION NUMBER " ^
         (string_of_int !iterations) ^ " " ^ (String.make 35 '~') ^ "\n");
-    let {logic_env; path_cond = pc; sym_frame; sym_code; _} = try sym_eval !c with
+    let {logic_env; path_cond = pc; _} = try sym_eval !c with
       | InstrLimit conf ->
           let {logic_env; _} = conf in
           write_test_case test_suite "%s/test_%05d.json" Logicenv.(to_json (to_list logic_env));
@@ -991,14 +977,14 @@ let concolic_execute0 (func : func_inst) (vs : sym_value list) : sym_value list 
           debug ("\n" ^ (string_of_region at) ^ ": Assertion Failure\n" ^ wit);
           if not !Flags.branches then raise (AssertFail (conf, at, wit))
                   else conf
-      | Trap (at, msg) -> Trap.error at msg
       | e -> raise e
     in
+    write_test_case test_suite "%s/test_%05d.json" Logicenv.(to_json (to_list logic_env));
+    iterations := !iterations + 1;
     if (pc = []) && (!assumes = []) then
       raise Unsatisfiable;
 
     (* write current model as a test *)
-    write_test_case test_suite "%s/test_%05d.json" Logicenv.(to_json (to_list logic_env));
 
    (* DEBUG: *)
     let delim = String.make 6 '$' in
@@ -1019,39 +1005,14 @@ let concolic_execute0 (func : func_inst) (vs : sym_value list) : sym_value list 
     let bindings = List.map (fun (_, f) -> f) (Globalpc.bindings global_pc') in
     let formula = (Formula.conjuct bindings) in
 
-
     if !Flags.trace then
       debug ("\n\n" ^ delim ^ " GLOBAL PATH CONDITION " ^ delim ^ "\n" ^
             (Formula.pp_to_string formula) ^ "\n" ^ (String.make 28 '$') ^ "\n");
-
-    solver_cnt := !solver_cnt + 1;
-    let start = Sys.time () in
-    let opt_model = Z3Encoding2.check_sat_core formula in
-    let curr_time = (Sys.time ()) -. start in
-    solver_time := !solver_time +. curr_time;
-
+    let prev_time = !solver_time in
+    let opt_model = timed_check_sat formula in
     let model = try Option.get opt_model with _ ->
       raise Unsatisfiable in
-
-    let li32 = Logicenv.get_vars_by_type I32Type logic_env in
-    let li64 = Logicenv.get_vars_by_type I64Type logic_env in
-    let lf32 = Logicenv.get_vars_by_type F32Type logic_env in
-    let lf64 = Logicenv.get_vars_by_type F64Type logic_env in
-    (* 3. Obtain a concrete model for the global path condition *)
-    let binds = Z3Encoding2.lift_z3_model model li32 li64 lf32 lf64 in
-
-    if binds = [] then
-      raise Unsatisfiable;
-
-    (* Prepare next iteration *)
-    assumes := [];
-    Hashtbl.reset chunk_table;
-    Logicenv.reset logic_env;
-    Logicenv.init logic_env binds;
-    Symmem2.clear !c.sym_mem;
-    Symmem2.init !c.sym_mem initial_memory;
-    Instance.set_globals !inst initial_globals;
-    c := {!c with sym_budget = 100000; sym_code = initial_sym_code; path_cond = []};
+    c := update_config model logic_env c inst init_mem init_glob init_code;
 
     if !Flags.trace then (
       let formula_len = Formula.length formula in
@@ -1063,16 +1024,12 @@ let concolic_execute0 (func : func_inst) (vs : sym_value list) : sym_value list 
             (string_of_int !iterations) ^ " STATISTICS: " ^ (String.make 23 '-'));
       debug ("PATH CONDITION SIZE: " ^ (string_of_int (Formula.length pc')));
       debug ("GLOBAL PATH CONDITION SIZE: " ^ (string_of_int formula_len));
-      debug ("TIME TO SOLVE GLOBAL PC: " ^ (string_of_float curr_time) ^ "\n" ^
+      debug ("TIME TO SOLVE GLOBAL PC: " ^ (string_of_float (!solver_time -. prev_time)) ^ "\n" ^
             (String.make 73 '-') ^ "\n\n");
       debug ((String.make 92 '~') ^ "\n");
     );
-
-    iterations := !iterations + 1;
-    (*let env_constraint = Formula.to_formula (Logicenv.to_expr logic_env) in*)
     loop global_pc'
   in
-
   debug ((String.make 92 '~') ^ "\n");
   let global_pc = Globalpc.add "True" Formula.True Globalpc.empty in
   loop_start := Sys.time ();
@@ -1082,23 +1039,25 @@ let concolic_execute0 (func : func_inst) (vs : sym_value list) : sym_value list 
         true, "{}", "[]"
     | AssertFail (_, r, wit) ->
         incomplete := true;
+        let pos = (Source.string_of_pos r.left ^ (
+          if r.right = r.left then ""
+                              else "-" ^ string_of_pos r.right)) in
         let reason = "{" ^
-          "\"type\" : \""    ^ "Assertion Failure" ^ "\", " ^
-          "\"line\" : \"" ^ (Source.string_of_pos r.left ^
-              (if r.right = r.left then "" else "-" ^ string_of_pos r.right)) ^ "\"" ^
-        "}"
-        in
-        write_test_case test_suite "%s/witness_%05d.json" wit;
+          "\"type\" : \"" ^ "Assertion Failure" ^ "\", " ^
+          "\"line\" : \"" ^ pos                 ^ "\"" ^
+        "}" 
+        in write_test_case test_suite "%s/witness_%05d.json" wit;
         false, reason, wit
     | BugException (b, r, wit) ->
         incomplete := true;
+        let pos = Source.string_of_pos r.left ^ (
+          if r.right = r.left then ""
+                              else "-" ^ string_of_pos r.right) in
         let reason = "{" ^
-          "\"type\" : \""    ^ (string_of_bug b) ^ "\", " ^
-          "\"line\" : \"" ^ (Source.string_of_pos r.left ^
-              (if r.right = r.left then "" else "-" ^ string_of_pos r.right)) ^ "\"" ^
+          "\"type\" : \"" ^ (string_of_bug b) ^ "\", " ^
+          "\"line\" : \"" ^ pos               ^ "\"" ^
         "}"
-        in
-        write_test_case test_suite "%s/witness_%05d.json" wit;
+        in write_test_case test_suite "%s/witness_%05d.json" wit;
         false, reason, wit
     | e -> raise e
   in
@@ -1126,132 +1085,25 @@ let concolic_execute0 (func : func_inst) (vs : sym_value list) : sym_value list 
     "\"incomplete\" : "          ^ (string_of_bool !incomplete)   ^
   "}"
   in Io.save_file (Filename.concat !Flags.output "report.json") fmt_str;
+  !c.sym_code
 
-  let (vs, _) = !c.sym_code in
-  try List.rev vs with Stack_overflow ->
-    Exhaustion.error at "call stack exhausted"
-
-(*  Symbolic invoke  *)
-(*
-let sym_invoke (func : func_inst) (vs : sym_value list) : sym_value list =
-  let at = match func with Func.AstFunc (_,_, f) -> f.at | _ -> no_region in
-  let inst_ref = try Option.get (Func.get_inst func) with Invalid_argument s ->
-    Crash.error at ("sym_invoke: " ^ s) in
+let sym_invoke' (func : func_inst) (vs : sym_value list) : sym_value list =
+  (* Prepare workspace *)
+  let test_suite = Filename.concat !Flags.output "test_suite" in
+  Io.safe_mkdir test_suite;
+  (* Prepare inital configuration *)
+  let at = match func with Func.AstFunc (_, _, f) -> f.at | _ -> no_region in
+  let inst = try Option.get (Func.get_inst func) 
+             with Invalid_argument s -> Crash.error at ("sym_invoke: " ^ s) in
   let c = ref (sym_config empty_module_inst (List.rev vs) [SInvoke func @@ at]
-      !inst_ref.sym_memory) in
-  let initial_memory = Symmem2.memcpy !inst_ref.sym_memory in
-  (*  ----------------  CONCOLIC EXECUTION  ----------------  *)
-  (* Model satisfiability *)
-  let satisfiable = ref true in
-  (* 1. Initialize the global path condition *)
-  let v = Symvalue.Value (I32 0l) in
-  let e = I32Relop (I32Eq, v, v) in
-  let big_pi      = ref  e  in
-  let big_pi_list = ref [e] in
-  let global_time_z3 = ref 0. in
-  Printf.printf "\n\n~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n\n";
-  (* 2. Check if the global path conditions is satisfiable *)
-  while !satisfiable do
-    Printf.printf "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ ITERATION NUMBER %s ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n\n" (string_of_int !iterations);
-    (* 4. Execute the concolic interpreter with the obtained model *)
-    let {sym_frame = frame;
-         sym_code = vs, es;
-         logic_env;
-         path_cond = pi;
-         _} = (sym_eval !c)
-    in
-    if pi = [] then begin
-      satisfiable := false
-    end else begin
-      Printf.printf "\n\n$$$$$$ LOGICAL ENVIRONMENT BEFORE Z3 STATE $$$$$$\n";
-      Printf.printf "%s" (Logicenv.to_string logic_env);
-      Printf.printf "$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$\n\n";
-
-      Printf.printf "\n\n$$$$$$ PATH CONDITIONS BEFORE Z3 $$$$$$\n";
-      Printf.printf "%s\n" (pp_string_of_pc pi);
-      Printf.printf "$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$\n";
-
-      (* Negate the path conditions obtained in sym_eval.
-        Returns sym_value that ORs all of those negations *)
-      let pi_i = neg_expr (and_list pi) in
-      (* ANDs pi_i with the negated expressions from previous iterations *)
-      big_pi := BoolOp (And, pi_i, !big_pi);
-      big_pi_list := [pi_i] @ !big_pi_list;
-
-      Printf.printf "\n\n$$$$$$ BIG PI REPRESENTATION $$$$$$\n";
-      Printf.printf "%s\n" (pp_string_of_pc [!big_pi]);
-      Printf.printf "$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$\n\n";
-
-      (* FOR STATISTICS: measuring the size of pi and big_pi *)
-      let size_pi     = Symvalue.length (Symvalue.and_list pi) in
-      let size_big_pi = Symvalue.length !big_pi in
-
-
-      (* STATISTICS: measure time it takes to find a new logic environment *)
-      let total_time = ref 0. in
-      let start_time = Sys.time () in
-
-      (* Check the satisfiability of the conditions *)
-      let model : (Z3.Model.model option) = Z3Encoding2.check_sat_core [!big_pi] in
-
-      (* According to the satisfiability of the model... *)
-      let print_str =
-        match model with
-        | None ->
-            satisfiable := false;
-            total_time := (Sys.time ()) -. start_time;
-            "Model is no longer satisfiable. All paths have been verified.\n"
-        | Some m ->
-            (* Get variable names from the symbolic store -- according to the model *)
-            let li32 = Logicenv.get_sym_int32_vars logic_env in
-            let li64 = Logicenv.get_sym_int64_vars logic_env in
-            let lf32 = Logicenv.get_sym_float32_vars logic_env in
-            let lf64 = Logicenv.get_sym_float64_vars logic_env in
-
-            (* Obtain new symbolic store *)
-            let sym_st = Z3Encoding2.lift_z3_model m li32 li64 lf32 lf64 in
-            if Logicenv.is_empty sym_st then satisfiable := false;
-
-            total_time := (Sys.time ()) -. start_time;
-            global_time_z3 := !global_time_z3 +. !total_time;
-
-            let envc = Logicenv.neg_pc sym_st in
-            big_pi := BoolOp (And, envc, !big_pi);
-            big_pi_list := !big_pi_list @ [envc];
-            !c.logic_env <- sym_st;
-            !c.sym_mem   <- initial_memory;
-            (*c := {!c with logic_env = sym_st; sym_mem = initial_memory};*)
-
-            "SATISFIABLE\n" ^
-            "MODEL: \n" ^ (Z3.Model.to_string m) ^ "\n" ^
-            "\n\n$$$$$$ NEW LOGICAL ENVIRONMENT STATE $$$$$$\n" ^
-            (Logicenv.to_string sym_st) ^
-            "$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$\n\n"
-      in Printf.printf "%s" print_str;
-
-      Printf.printf "\n------------------------ ITERATION %02d STATISTICS: ------------------------\n" !iterations;
-      Printf.printf "PATH CONDITIONS SIZE: %d\n" size_pi;
-      Printf.printf "GLOBAL PATH CONDITION SIZE: %d\n" size_big_pi;
-      Printf.printf "TIME TO RETRIEVE NEW LOGICAL ENVIRONMENT: %f\n" !total_time;
-      Printf.printf "--------------------------------------------------------------------------\n\n\n";
-
-      Printf.printf "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n\n";
-      iterations := !iterations + 1;
-      lines := []
-    end
-  done;
-  Printf.printf "\n\n>>>> END OF THE CONCOLIC EXECUTION. ASSUME FAILS WHEN:\n%s\n\n" (Constraints.print_constraints finish_constraints);
-  Printf.printf ">>>> TEST COVERAGE LINES:\n";
-  let ranges = Ranges.range_list !lines_total in
-  Printf.printf "%s\n" ranges;
-
-  Printf.printf "\n>>>> TOTAL TIME SPENT w/ THE SOLVER: %f\n" !global_time_z3;
-
-  let (vs, _) = !c.sym_code in
+    !inst.sym_memory) in
+  (* Set analysis time limit *)
+  set_timeout !Flags.timeout;
+  (* Dispatch *)
+  let f = if !Flags.search then random_search else guided_search in
+  let (vs, _) = f c inst test_suite in
   try List.rev vs with Stack_overflow ->
     Exhaustion.error at "call stack exhausted"
-*)
-
 
 let eval_const (inst : module_inst) (const : const) : value =
   let sym_mem = inst.sym_memory in

@@ -12,3 +12,4 @@ let smt_assume = ref false
 let simplify = ref true
 let timeout = ref 895
 let queries = ref true
+let search = ref true
