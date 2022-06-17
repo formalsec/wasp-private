@@ -236,20 +236,16 @@ let fresh_sym_var : (unit -> string) =
   fresh_sth "#DVAR"
 
 let record_branch (path : path_conditions) : unit =
-  if (List.length path) > 0 then begin
-    let path_str = Formula.(to_string (to_formula path)) in
-    if not (Hashtbl.mem execution_tree path_str) then
-      Hashtbl.add execution_tree path_str true
-  end
+  if ((List.length path) > 0) && (not !Flags.search) then
+    if not (Hashtbl.mem execution_tree path) then
+      Hashtbl.add execution_tree path true
 
 let push_new_path (path : path_conditions) : unit =
-  if (List.length path) > 0 then begin
-    let path_str = Formula.(to_string (to_formula path)) in
-    if not (Hashtbl.mem execution_tree path_str) then begin
-      Hashtbl.add execution_tree path_str true;
+  if ((List.length path) > 0) && (not !Flags.search) then
+    if not (Hashtbl.mem execution_tree path) then begin
+      Hashtbl.add execution_tree path true;
       Stack.push path to_explore
     end
-  end
 
 (*  Symbolic step  *)
 let rec sym_step (c : sym_config) : sym_config =
@@ -535,7 +531,7 @@ let rec sym_step (c : sym_config) : sym_config =
       | SymAssume, (I32 i, ex) :: vs' ->
         let cond = to_constraint (simplify ex) in
         let pc' =
-          if !Flags.smt_assume then (
+          if false then (
               assumes := Option.map_default (fun a -> a :: !assumes) !assumes cond;
               pc
           ) else Option.map_default (fun a -> a :: pc) pc cond
@@ -900,7 +896,7 @@ let guided_search c inst test_suite =
       c := update_config model logic_env c inst init_mem init_glob init_code;
       loop ()
     end
-  in 
+  in
   loop_start := Sys.time ();
   let spec, reason, wit = try loop () with
     | Unsatisfiable -> true, "{}", "[]"
@@ -971,6 +967,7 @@ let random_search
           write_test_case test_suite "%s/test_%05d.json" Logicenv.(to_json (to_list logic_env));
           raise Unsatisfiable
       | AssumeFail (conf, cons) ->
+          iterations := !iterations - 1;
           Constraints.add finish_constraints !iterations cons;
           conf
       | AssertFail (conf, at, wit) ->
