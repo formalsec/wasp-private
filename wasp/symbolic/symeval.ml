@@ -41,6 +41,9 @@ let numeric_error at = function
        string_of_int i ^ ", got " ^ Types.string_of_value_type (Values.type_of v))
   | exn -> raise exn
 
+
+type policy = Random | Depth
+
 type bug =
   | Overflow
   | UAF
@@ -122,17 +125,15 @@ let loop_start = ref 0.
 
 let chunk_table = Hashtbl.create 512
 
+(* Search policy *)
+let current_policy = ref Random
+
+(* Depth search policy constructs *)
 let execution_tree = Hashtbl.create 512
 let to_explore : (sym_expr list) Stack.t = Stack.create ()
 
 (* Helpers *)
 let debug str = if !Flags.trace then print_endline str
-
-let time_call f args acc =
-  let start = Sys.time () in
-  let ret = f args in
-  acc := !acc +. ((Sys.time ()) -. start);
-  ret
 
 let timed_check_sat formula =
   let start = Sys.time () in
@@ -141,6 +142,12 @@ let timed_check_sat formula =
   solver_time := !solver_time +. delta;
   solver_cnt := !solver_cnt + 1;
   opt_model
+
+let parse_policy (p : string) : policy option =
+  match p with
+  | "random" -> Some Random
+  | "depth"  -> Some Depth
+  | _        -> None
 
 let string_of_bug : (bug -> string) = function
   | Overflow -> "Overflow"
@@ -236,12 +243,12 @@ let fresh_sym_var : (unit -> string) =
   fresh_sth "#DVAR"
 
 let record_branch (path : path_conditions) : unit =
-  if ((List.length path) > 0) && (not !Flags.search) then
+  if (not (!current_policy = Random)) && ((List.length path) > 0) then
     if not (Hashtbl.mem execution_tree path) then
       Hashtbl.add execution_tree path true
 
 let push_new_path (path : path_conditions) : unit =
-  if ((List.length path) > 0) && (not !Flags.search) then
+  if (not (!current_policy = Random)) && ((List.length path) > 0) then
     if not (Hashtbl.mem execution_tree path) then begin
       Hashtbl.add execution_tree path true;
       Stack.push path to_explore
@@ -478,8 +485,7 @@ let rec sym_step (c : sym_config) : sym_config =
             let c = Option.map negate_relop (to_constraint ex') in
             let pc' = Option.map_default (fun a -> a :: pc) pc c in
             let assertion = Formula.to_formula (!assumes @ pc') in
-            solver_cnt := !solver_cnt + 1;
-            let model = time_call Z3Encoding2.check_sat_core assertion solver_time in
+            let model = timed_check_sat assertion in
             match model with
             | None   -> []
             | Some m ->
@@ -967,7 +973,6 @@ let random_search
           write_test_case test_suite "%s/test_%05d.json" Logicenv.(to_json (to_list logic_env));
           raise Unsatisfiable
       | AssumeFail (conf, cons) ->
-          iterations := !iterations - 1;
           Constraints.add finish_constraints !iterations cons;
           conf
       | AssertFail (conf, at, wit) ->
@@ -1097,7 +1102,12 @@ let sym_invoke' (func : func_inst) (vs : sym_value list) : sym_value list =
   (* Set analysis time limit *)
   set_timeout !Flags.timeout;
   (* Dispatch *)
-  let f = if !Flags.search then random_search else guided_search in
+  let p = parse_policy !Flags.policy in
+  let f = match p with
+    | None -> Crash.error at "wrong search policy provided."
+    | Some Random -> random_search
+    | Some Depth  -> current_policy := Depth; guided_search
+  in
   let (vs, _) = f c inst test_suite in
   try List.rev vs with Stack_overflow ->
     Exhaustion.error at "call stack exhausted"

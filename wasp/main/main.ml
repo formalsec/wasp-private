@@ -40,7 +40,9 @@ let argspec = Arg.align
   "--smt-assume", Arg.Set Flags.smt_assume,
     " use the solver to progress in the assume rule";
   "--no-simplify", Arg.Clear Flags.simplify,
-    " do not perform algebraic simplifications of symbolic expressions"
+    " do not perform algebraic simplifications of symbolic expressions";
+  "--policy", Arg.Set_string Flags.policy,
+    " search policy random|depth. (default: random)"
 ]
 
 let () =
