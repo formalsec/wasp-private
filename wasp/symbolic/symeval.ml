@@ -51,9 +51,9 @@ type bug =
 
 type interruption =
   | IntLimit
+  | AssFail of path_conditions
   | AsmFail of path_conditions
-  | AssFail of string
-  | Bug of bug * string
+  | Bug of bug
 
 (* Administrative Expressions & Configurations *)
 type 'a stack = 'a list
@@ -107,8 +107,8 @@ let sym_config inst vs es sym_m = {
 
 exception InstrLimit of sym_config
 exception AssumeFail of sym_config * path_conditions
-exception AssertFail of sym_config * region * string
-exception BugException of bug * region * string
+exception AssertFail of sym_config * region
+exception BugException of sym_config * region * bug
 exception Unsatisfiable
 
 let lines_to_ignore = ref 0
@@ -134,6 +134,15 @@ let to_explore : (sym_expr list) Stack.t = Stack.create ()
 
 (* Helpers *)
 let debug str = if !Flags.trace then print_endline str
+
+(* Generic counter *)
+let count (init : int) : (unit -> int)=
+  let next = ref init in
+  let next () =
+    let n = !next in
+    next := n + 1;
+    n
+  in next
 
 let timed_check_sat formula =
   let start = Sys.time () in
@@ -372,12 +381,12 @@ let rec sym_step (c : sym_config) : sym_config =
             let low = I32Value.of_value (Option.get ptr) in
             let chunk_size =
               try Hashtbl.find chunk_table low
-              with Not_found -> raise (BugException (UAF, e.at, "")) in
+              with Not_found -> raise (BugException (c, e.at, UAF)) in
             let high = Int64.(add (of_int32 low) (of_int32 chunk_size))
             and ptr_val = Int64.(add base (of_int32 offset)) in
             (* ptr_val \notin [low, high[ => overflow *)
             if ptr_val < (Int64.of_int32 low) || ptr_val >= high then
-              raise (BugException (Overflow, e.at, ""))
+              raise (BugException (c, e.at, Overflow))
           end;
           let (v, e) =
             match sz with
@@ -387,9 +396,8 @@ let rec sym_step (c : sym_config) : sym_config =
           (*print_endline ("after load: " ^ (Symvalue.to_string e));*)
           (v, e) :: vs', [], logic_env, pc, mem
         with
-        | BugException (b, at, _) ->
-          let env_str = Logicenv.(to_json (to_list logic_env)) in
-          vs', [Interrupt (Bug (b, env_str)) @@ e.at], logic_env, pc, mem
+        | BugException (_, at, b) ->
+          vs', [Interrupt (Bug b) @@ e.at], logic_env, pc, mem
         | exn ->
           vs', [STrapping (memory_error e.at exn) @@ e.at], logic_env, pc, mem
         end
@@ -402,11 +410,11 @@ let rec sym_step (c : sym_config) : sym_config =
             let low = I32Value.of_value (Option.get ptr) in
             let chunk_size =
               try Hashtbl.find chunk_table low
-              with Not_found -> raise (BugException (UAF, e.at, "")) in
+              with Not_found -> raise (BugException (c, e.at, UAF)) in
             let high = Int64.(add (of_int32 low) (of_int32 chunk_size))
             and ptr_val = Int64.(add base (of_int32 offset)) in
             if (Int64.of_int32 low) > ptr_val || ptr_val >= high then
-              raise (BugException (Overflow, e.at, ""))
+              raise (BugException (c, e.at, Overflow))
           end;
           begin match sz with
           | None    -> Symmem2.store_value mem base offset (v, ex)
@@ -414,9 +422,8 @@ let rec sym_step (c : sym_config) : sym_config =
           end;
           vs', [], logic_env, pc, mem
         with
-        | BugException (b, at, _) ->
-          let env_str = Logicenv.(to_json (to_list logic_env)) in
-          vs', [Interrupt (Bug (b, env_str)) @@ e.at], logic_env, pc, mem
+        | BugException (_, at, b) ->
+          vs', [Interrupt (Bug b) @@ e.at], logic_env, pc, mem
         | exn ->
           vs', [STrapping (memory_error e.at exn) @@ e.at], logic_env, pc, mem
         end
@@ -472,9 +479,7 @@ let rec sym_step (c : sym_config) : sym_config =
 
       | SymAssert, (I32 0l, ex) :: vs' -> (* 0 on top of stack *)
         debug ">>> Assert FAILED! Stopping...";
-        let es' =
-          [Interrupt (AssFail Logicenv.(to_json (to_list logic_env))) @@ e.at]
-        in vs', es', logic_env, pc, mem
+        vs', [Interrupt (AssFail pc) @@ e.at], logic_env, pc, mem
 
       | SymAssert, (I32 i, ex) :: vs' -> (* != 0 on top of stack *)
         debug ">>> Assert reached. Checking satisfiability...";
@@ -495,7 +500,7 @@ let rec sym_step (c : sym_config) : sym_config =
               and lf64 = Logicenv.get_vars_by_type F64Type logic_env in
               let binds = Z3Encoding2.lift_z3_model m li32 li64 lf32 lf64 in
               Logicenv.update logic_env binds;
-              [Interrupt (AssFail Logicenv.(to_json (to_list logic_env))) @@ e.at] in
+              [Interrupt (AssFail pc) @@ e.at] in
         if es' = [] then
           debug "\n\n###### Assertion passed ######";
         vs', es', logic_env, pc, mem
@@ -570,8 +575,7 @@ let rec sym_step (c : sym_config) : sym_config =
       | Free, (I32 i, _) :: vs' ->
         let es' =
           if not (Hashtbl.mem chunk_table i) then (
-            let witness = Logicenv.(to_json (to_list logic_env)) in
-            [Interrupt (Bug (InvalidFree, witness)) @@ e.at]
+            [Interrupt (Bug InvalidFree) @@ e.at]
           ) else (
             Hashtbl.remove chunk_table i;
             []
@@ -811,10 +815,10 @@ let rec sym_eval (c : sym_config) : sym_config = (* c_sym_value stack *)
 
   | vs, {it = Interrupt i; at} :: es ->
       let exn = match i with
-        | IntLimit    -> InstrLimit c
-        | AsmFail pc  -> AssumeFail ({c with sym_code = vs, es}, pc)
-        | AssFail wit -> AssertFail (c, at, wit)
-        | Bug (b, wit)-> BugException (b, at, wit)
+        | IntLimit   -> InstrLimit c
+        | AsmFail pc -> AssumeFail ({c with sym_code = vs, es}, pc)
+        | AssFail pc -> AssertFail (c, at)
+        | Bug b      -> BugException (c, at, b)
       in raise exn
 
   | vs, es ->
@@ -823,41 +827,47 @@ let rec sym_eval (c : sym_config) : sym_config = (* c_sym_value stack *)
 (* Functions & Constants *)
 module Globalpc = Map.Make(String)
 
-let counter = ref 0
-let next_int () =
-  fun () ->
-    counter := !counter + 1;
-    !counter
+let get_reason error : string =
+  let type_str, r = error in
+  let region_str = Source.string_of_pos r.left ^
+    (if r.right = r.left then ""
+                         else "-" ^ string_of_pos r.right) in
+  "{" ^
+    "\"type\" : \"" ^ type_str ^ "\", " ^
+    "\"line\" : \"" ^ region_str ^ "\"" ^
+  "}"
+
+let write_test_case out_dir fmt test_data cntr : unit =
+  let i = cntr () in
+  Io.save_file (Printf.sprintf fmt out_dir i) test_data
+
+let write_report spec reason witness coverage loop_time : unit =
+  let report_str = "{" ^
+    "\"specification\": "        ^ (string_of_bool spec)          ^ ", " ^
+    "\"reason\" : "              ^ reason                         ^ ", " ^
+    "\"witness\" : "             ^ witness                        ^ ", " ^
+    "\"coverage\" : \""          ^ (string_of_float coverage)     ^ "\", " ^
+    "\"loop_time\" : \""         ^ (string_of_float loop_time)    ^ "\", " ^
+    "\"solver_time\" : \""       ^ (string_of_float !solver_time) ^ "\", " ^
+    "\"paths_explored\" : "      ^ (string_of_int !iterations)    ^ ", " ^
+    "\"solver_counter\" : "      ^ (string_of_int !solver_cnt)    ^ ", " ^
+    "\"instruction_counter\" : " ^ (string_of_int !step_cnt)      ^ ", " ^
+    "\"incomplete\" : "          ^ (string_of_bool !incomplete)   ^
+  "}"
+  in Io.save_file (Filename.concat !Flags.output "report.json") report_str
 
 let set_timeout (time_limit : int) : unit =
   let alarm_handler i : unit = 
     Z3Encoding2.interrupt_z3 ();
     incomplete := true;
     let loop_time = (Sys.time ()) -. !loop_start in
-    let fmt_str = "{" ^
-      "\"specification\": "        ^ "true"                         ^ ", " ^
-      "\"reason\" : "              ^ "[]"                           ^ ", " ^
-      "\"witness\" : "             ^ "{}"                           ^ ", " ^
-      "\"coverage\" : \""          ^ "0.0"                          ^ "\", " ^
-      "\"loop_time\" : \""         ^ (string_of_float loop_time)    ^ "\", " ^
-      "\"solver_time\" : \""       ^ (string_of_float !solver_time) ^ "\", " ^
-      "\"paths_explored\" : "      ^ (string_of_int !iterations)    ^ ", " ^
-      "\"solver_counter\" : "      ^ (string_of_int !solver_cnt)    ^ ", " ^
-      "\"instruction_counter\" : " ^ (string_of_int !step_cnt)      ^ ", " ^
-      "\"incomplete\" : "          ^ (string_of_bool !incomplete)   ^
-    "}"
-    in
-    Io.save_file (Filename.concat !Flags.output "report.json") fmt_str;
+    write_report true "{}" "[]" 0.0 loop_time;
     exit 0
   in
   if time_limit > 0 then (
     Sys.(set_signal sigalrm (Signal_handle alarm_handler));
     ignore (Unix.alarm time_limit)
   )
-
-let write_test_case out_dir fmt test_data : unit =
-  let i = next_int () in
-  Io.save_file (Printf.sprintf fmt out_dir (i ())) test_data
 
 let update_config model logic_env c inst mem glob code =
   let li32 = Logicenv.get_vars_by_type I32Type logic_env
@@ -868,16 +878,68 @@ let update_config model logic_env c inst mem glob code =
   Hashtbl.reset chunk_table;
   Logicenv.reset logic_env;
   Logicenv.init logic_env binds;
-  Symmem2.clear !c.sym_mem;
-  Symmem2.init !c.sym_mem mem;
+  Symmem2.clear c.sym_mem;
+  Symmem2.init c.sym_mem mem;
   Instance.set_globals !inst glob;
-  {!c with sym_budget=100000; sym_code=code; path_cond=[]}
+  {c with sym_budget=100000; sym_code=code; path_cond=[]}
 
 let guided_search c inst test_suite =
   (* Save initial module configs *)
-  let init_mem = Symmem2.to_list !inst.sym_memory in
-  let init_glob = Global.contents !inst.globals in
-  let init_code = !c.sym_code in
+  let test_cntr = count 1
+  and ini_mem  = Symmem2.to_list !inst.sym_memory
+  and ini_code = !c.sym_code
+  and ini_glob = Global.contents !inst.globals
+  and finish = ref false in
+  (* Helper f: Find some sat model in the remaining paths *)
+  let rec find_sat_pc pcs =
+    if Stack.is_empty pcs then None
+    else match timed_check_sat (Formula.to_formula (Stack.pop pcs)) with
+    | None   -> find_sat_pc pcs
+    | Some m -> Some m
+  in
+  (* Main concolic loop *)
+  let err = ref None in
+  let rec loop conf =
+    let {logic_env = lenv; _} = try sym_eval conf with
+      | InstrLimit c'            -> finish := true; c'
+      | AssumeFail (c', _)       -> c'
+      | AssertFail (c', at)      -> err := Some ("Assertion Failure", at); c'
+      | BugException (c', at, b) -> err := Some (string_of_bug b, at); c'
+      | e -> raise e
+    in iterations := !iterations + 1;
+    let testcase = Logicenv.(to_json (to_list lenv)) in
+    if Option.is_some !err then 
+      write_test_case test_suite "%s/witness_%05d.json" testcase test_cntr
+    else
+      write_test_case test_suite "%s/test_%05d.json" testcase test_cntr;
+    if Option.is_some !err then (
+      incomplete := true;
+      false, get_reason (Option.get !err), testcase
+    ) else if !finish || Stack.is_empty to_explore then (
+      true, "{}", "[]"
+    ) else (
+      match find_sat_pc to_explore with
+      | None   -> true, "{}", "[]"
+      | Some m -> loop (update_config m lenv conf inst ini_mem ini_glob ini_code)
+    )
+  in
+  loop_start := Sys.time ();
+  let spec, reason, witness = loop !c in
+  let loop_time = (Sys.time ()) -. !loop_start in
+  let n_lines = List.((length !inst.types) + (length !inst.tables) +
+                      (length !inst.memories) + (length !inst.globals) +
+                      (length !inst.exports) + 1) in
+  let coverage = (Coverage.calculate_cov inst (n_lines + !lines_to_ignore)) *. 100.0 in
+  write_report spec reason witness coverage loop_time;
+  !c.sym_code
+
+(*
+let guided_search c inst test_suite =
+  (* Save initial module configs *)
+  let test_cntr = count 1
+  and init_mem  = Symmem2.to_list !inst.sym_memory
+  and init_glob = Global.contents !inst.globals
+  and init_code = !c.sym_code in
   let rec loop () =
     let finish = ref false in
     let {logic_env; _} = try sym_eval !c with
@@ -887,7 +949,7 @@ let guided_search c inst test_suite =
     in iterations := !iterations + 1;
     (* Execution success, we can save inputs *)
     let assignments = Logicenv.(to_json (to_list logic_env)) in
-    write_test_case test_suite "%s/test_%05d.json" assignments;
+    write_test_case test_suite "%s/test_%05d.json" assignments test_cntr;
     (* Check termination conditions *)
     if ((Stack.is_empty to_explore) || !finish) then true, "{}", "[]"
     else begin
@@ -917,7 +979,7 @@ let guided_search c inst test_suite =
           "\"line\" : \"" ^ pos_str             ^ "\"" ^
         "}" 
         in
-        write_test_case test_suite "%s/witness_%05d.json" wit;
+        write_test_case test_suite "%s/witness_%05d.json" wit test_cntr;
         false, reason, wit
     | BugException (b, r, wit) ->
         incomplete := true;
@@ -930,7 +992,7 @@ let guided_search c inst test_suite =
           "\"line\" : \"" ^ pos               ^ "\"" ^
         "}"
         in
-        write_test_case test_suite "%s/witness_%05d.json" wit;
+        write_test_case test_suite "%s/witness_%05d.json" wit test_cntr;
         false, reason, wit
     | e -> raise e
   in
@@ -953,13 +1015,15 @@ let guided_search c inst test_suite =
   "}"
   in Io.save_file (Filename.concat !Flags.output "report.json") fmt_str;
   !c.sym_code
+*)
 
 let random_search
     (c : sym_config ref)
     (inst : module_inst ref)
     (test_suite : string) =
   (* Initial memory config *)
-  let init_mem = Symmem2.to_list !inst.sym_memory
+  let test_cntr = count 1
+  and init_mem  = Symmem2.to_list !inst.sym_memory
   and init_glob = Global.contents !inst.globals
   and init_code = !c.sym_code
   and finish_constraints = Constraints.create
@@ -968,22 +1032,25 @@ let random_search
     debug ((String.make 35 '~') ^ " ITERATION NUMBER " ^
         (string_of_int !iterations) ^ " " ^ (String.make 35 '~') ^ "\n");
     let {logic_env; path_cond = pc; _} = try sym_eval !c with
-      | InstrLimit conf ->
-          let {logic_env; _} = conf in
-          write_test_case test_suite "%s/test_%05d.json" Logicenv.(to_json (to_list logic_env));
+      | InstrLimit c' ->
+          let {logic_env; _} = c' in
+          let assignments = Logicenv.(to_json (to_list logic_env)) in
+          write_test_case test_suite "%s/test_%05d.json" assignments test_cntr;
           raise Unsatisfiable
-      | AssumeFail (conf, cons) ->
+      | AssumeFail (c', cons) ->
           Constraints.add finish_constraints !iterations cons;
-          conf
-      | AssertFail (conf, at, wit) ->
+          c' 
+      | AssertFail (c', at) ->
+          let {logic_env = lenv; _} = c' in
+          let wit = Logicenv.(to_json (to_list lenv)) in
           debug ("\n" ^ (string_of_region at) ^ ": Assertion Failure\n" ^ wit);
-          if not !Flags.branches then raise (AssertFail (conf, at, wit))
-                  else conf
+          if not !Flags.branches then raise (AssertFail (c', at))
+                  else c'
       | e -> raise e
-    in
-    write_test_case test_suite "%s/test_%05d.json" Logicenv.(to_json (to_list logic_env));
-    iterations := !iterations + 1;
-    if (pc = []) && (!assumes = []) then
+    in iterations := !iterations + 1;
+    let testcase = Logicenv.(to_json (to_list logic_env)) in
+    write_test_case test_suite "%s/test_%05d.json" testcase test_cntr;
+    if (!iterations = 1) && (pc = []) && (!assumes = []) then
       raise Unsatisfiable;
 
     (* write current model as a test *)
@@ -1014,7 +1081,7 @@ let random_search
     let opt_model = timed_check_sat formula in
     let model = try Option.get opt_model with _ ->
       raise Unsatisfiable in
-    c := update_config model logic_env c inst init_mem init_glob init_code;
+    c := update_config model logic_env !c inst init_mem init_glob init_code;
 
     if !Flags.trace then (
       let formula_len = Formula.length formula in
@@ -1039,28 +1106,18 @@ let random_search
     | Unsatisfiable ->
         debug "Model is no longer satisfiable. All paths have been verified.\n";
         true, "{}", "[]"
-    | AssertFail (_, r, wit) ->
+    | AssertFail (c', r) ->
         incomplete := true;
-        let pos = (Source.string_of_pos r.left ^ (
-          if r.right = r.left then ""
-                              else "-" ^ string_of_pos r.right)) in
-        let reason = "{" ^
-          "\"type\" : \"" ^ "Assertion Failure" ^ "\", " ^
-          "\"line\" : \"" ^ pos                 ^ "\"" ^
-        "}" 
-        in write_test_case test_suite "%s/witness_%05d.json" wit;
-        false, reason, wit
-    | BugException (b, r, wit) ->
+        let {logic_env = lenv; _} = c' in
+        let wit = Logicenv.(to_json (to_list lenv)) in
+        write_test_case test_suite "%s/witness_%05d.json" wit test_cntr;
+        false, get_reason ("Assertion Failure", r), wit
+    | BugException (c', r, b) ->
         incomplete := true;
-        let pos = Source.string_of_pos r.left ^ (
-          if r.right = r.left then ""
-                              else "-" ^ string_of_pos r.right) in
-        let reason = "{" ^
-          "\"type\" : \"" ^ (string_of_bug b) ^ "\", " ^
-          "\"line\" : \"" ^ pos               ^ "\"" ^
-        "}"
-        in write_test_case test_suite "%s/witness_%05d.json" wit;
-        false, reason, wit
+        let {logic_env = lenv; _} = c' in
+        let wit = Logicenv.(to_json (to_list lenv)) in
+        write_test_case test_suite "%s/witness_%05d.json" wit test_cntr;
+        false, get_reason (string_of_bug b, r), wit
     | e -> raise e
   in
   let loop_time = (Sys.time ()) -. !loop_start in
@@ -1072,21 +1129,7 @@ let random_search
                       (length !inst.memories) + (length !inst.globals) +
                       (length !inst.exports) + 1) in
   let coverage = (Coverage.calculate_cov inst (n_lines + !lines_to_ignore)) *. 100.0 in
-
-  (* Execution report *)
-  let fmt_str = "{" ^
-    "\"specification\": "        ^ (string_of_bool spec)          ^ ", " ^
-    "\"reason\" : "              ^ reason                         ^ ", " ^
-    "\"witness\" : "             ^ wit                            ^ ", " ^
-    "\"coverage\" : \""          ^ (string_of_float coverage)     ^ "\", " ^
-    "\"loop_time\" : \""         ^ (string_of_float loop_time)    ^ "\", " ^
-    "\"solver_time\" : \""       ^ (string_of_float !solver_time) ^ "\", " ^
-    "\"paths_explored\" : "      ^ (string_of_int !iterations)    ^ ", " ^
-    "\"solver_counter\" : "      ^ (string_of_int !solver_cnt)    ^ ", " ^
-    "\"instruction_counter\" : " ^ (string_of_int !step_cnt)      ^ ", " ^
-    "\"incomplete\" : "          ^ (string_of_bool !incomplete)   ^
-  "}"
-  in Io.save_file (Filename.concat !Flags.output "report.json") fmt_str;
+  write_report spec reason wit coverage loop_time;
   !c.sym_code
 
 let sym_invoke' (func : func_inst) (vs : sym_value list) : sym_value list =
@@ -1095,7 +1138,7 @@ let sym_invoke' (func : func_inst) (vs : sym_value list) : sym_value list =
   Io.safe_mkdir test_suite;
   (* Prepare inital configuration *)
   let at = match func with Func.AstFunc (_, _, f) -> f.at | _ -> no_region in
-  let inst = try Option.get (Func.get_inst func) 
+  let inst = try Option.get (Func.get_inst func)
              with Invalid_argument s -> Crash.error at ("sym_invoke: " ^ s) in
   let c = ref (sym_config empty_module_inst (List.rev vs) [SInvoke func @@ at]
     !inst.sym_memory) in
