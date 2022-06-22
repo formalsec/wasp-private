@@ -42,7 +42,8 @@ let argspec = Arg.align
   "--no-simplify", Arg.Clear Flags.simplify,
     " do not perform algebraic simplifications of symbolic expressions";
   "--policy", Arg.Set_string Flags.policy,
-    " search policy random|depth. (default: random)"
+    " search policy random|depth. (default: random)";
+  "--queries", Arg.Set Flags.queries, " output solver queries in .smt2 format";
 ]
 
 let () =

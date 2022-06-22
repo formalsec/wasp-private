@@ -837,9 +837,9 @@ let get_reason error : string =
     "\"line\" : \"" ^ region_str ^ "\"" ^
   "}"
 
-let write_test_case out_dir fmt test_data cntr : unit =
-  let i = cntr () in
-  Io.save_file (Printf.sprintf fmt out_dir i) test_data
+let write_test_case out_dir fmt test_data cnt : unit =
+  if not (test_data = "[]") then 
+    Io.save_file (Printf.sprintf fmt out_dir (cnt ())) test_data
 
 let write_report spec reason witness coverage loop_time : unit =
   let report_str = "{" ^
@@ -883,13 +883,13 @@ let update_config model logic_env c inst mem glob code =
   Instance.set_globals !inst glob;
   {c with sym_budget=100000; sym_code=code; path_cond=[]}
 
-let guided_search c inst test_suite =
+let guided_search conf inst test_suite =
   (* Save initial module configs *)
   let test_cntr = count 1
   and ini_mem  = Symmem2.to_list !inst.sym_memory
-  and ini_code = !c.sym_code
+  and ini_code = !conf.sym_code
   and ini_glob = Global.contents !inst.globals
-  and finish = ref false in
+  and finish = ref false and err = ref None in
   (* Helper f: Find some sat model in the remaining paths *)
   let rec find_sat_pc pcs =
     if Stack.is_empty pcs then None
@@ -898,9 +898,8 @@ let guided_search c inst test_suite =
     | Some m -> Some m
   in
   (* Main concolic loop *)
-  let err = ref None in
-  let rec loop conf =
-    let {logic_env = lenv; _} = try sym_eval conf with
+  let rec loop c =
+    let {logic_env = lenv; _} = try sym_eval c with
       | InstrLimit c'            -> finish := true; c'
       | AssumeFail (c', _)       -> c'
       | AssertFail (c', at)      -> err := Some ("Assertion Failure", at); c'
@@ -920,102 +919,18 @@ let guided_search c inst test_suite =
     ) else (
       match find_sat_pc to_explore with
       | None   -> true, "{}", "[]"
-      | Some m -> loop (update_config m lenv conf inst ini_mem ini_glob ini_code)
+      | Some m -> loop (update_config m lenv c inst ini_mem ini_glob ini_code)
     )
   in
   loop_start := Sys.time ();
-  let spec, reason, witness = loop !c in
+  let spec, reason, witness = loop !conf in
   let loop_time = (Sys.time ()) -. !loop_start in
   let n_lines = List.((length !inst.types) + (length !inst.tables) +
                       (length !inst.memories) + (length !inst.globals) +
                       (length !inst.exports) + 1) in
   let coverage = (Coverage.calculate_cov inst (n_lines + !lines_to_ignore)) *. 100.0 in
   write_report spec reason witness coverage loop_time;
-  !c.sym_code
-
-(*
-let guided_search c inst test_suite =
-  (* Save initial module configs *)
-  let test_cntr = count 1
-  and init_mem  = Symmem2.to_list !inst.sym_memory
-  and init_glob = Global.contents !inst.globals
-  and init_code = !c.sym_code in
-  let rec loop () =
-    let finish = ref false in
-    let {logic_env; _} = try sym_eval !c with
-      | InstrLimit c' -> finish := true; c'
-      | AssumeFail (c', _) -> c'
-      | e -> raise e
-    in iterations := !iterations + 1;
-    (* Execution success, we can save inputs *)
-    let assignments = Logicenv.(to_json (to_list logic_env)) in
-    write_test_case test_suite "%s/test_%05d.json" assignments test_cntr;
-    (* Check termination conditions *)
-    if ((Stack.is_empty to_explore) || !finish) then true, "{}", "[]"
-    else begin
-      let pc = ref (Formula.to_formula (Stack.pop to_explore)) in
-      let opt_model = ref (timed_check_sat !pc) in
-      while not (Option.is_some !opt_model) do
-        if Stack.is_empty to_explore then raise Unsatisfiable;
-        pc := Formula.to_formula (Stack.pop to_explore);
-        opt_model := timed_check_sat !pc
-      done;
-      let model = Option.get !opt_model in
-      c := update_config model logic_env c inst init_mem init_glob init_code;
-      loop ()
-    end
-  in
-  loop_start := Sys.time ();
-  let spec, reason, wit = try loop () with
-    | Unsatisfiable -> true, "{}", "[]"
-    | AssertFail (_, r, wit) ->
-        incomplete := true;
-        let pos_str = Source.string_of_pos r.left ^ 
-          (if r.right = r.left then ""
-                               else "-" ^ string_of_pos r.right)
-        in
-        let reason = "{" ^
-          "\"type\" : \"" ^ "Assertion Failure" ^ "\", " ^
-          "\"line\" : \"" ^ pos_str             ^ "\"" ^
-        "}" 
-        in
-        write_test_case test_suite "%s/witness_%05d.json" wit test_cntr;
-        false, reason, wit
-    | BugException (b, r, wit) ->
-        incomplete := true;
-        let pos = Source.string_of_pos r.left ^ 
-          (if r.right = r.left then ""
-                               else "-" ^ string_of_pos r.right)
-        in
-        let reason = "{" ^
-          "\"type\" : \"" ^ (string_of_bug b) ^ "\", " ^
-          "\"line\" : \"" ^ pos               ^ "\"" ^
-        "}"
-        in
-        write_test_case test_suite "%s/witness_%05d.json" wit test_cntr;
-        false, reason, wit
-    | e -> raise e
-  in
-  let loop_time = (Sys.time ()) -. !loop_start in
-  let n_lines = List.((length !inst.types) + (length !inst.tables) +
-                      (length !inst.memories) + (length !inst.globals) +
-                      (length !inst.exports) + 1) in
-  let coverage = (Coverage.calculate_cov inst (n_lines + !lines_to_ignore)) *. 100.0 in
-  let fmt_str = "{" ^
-    "\"specification\": "        ^ (string_of_bool spec)          ^ ", " ^
-    "\"reason\" : "              ^ reason                         ^ ", " ^
-    "\"witness\" : "             ^ wit                            ^ ", " ^
-    "\"coverage\" : \""          ^ (string_of_float coverage)     ^ "\", " ^
-    "\"loop_time\" : \""         ^ (string_of_float loop_time)    ^ "\", " ^
-    "\"solver_time\" : \""       ^ (string_of_float !solver_time) ^ "\", " ^
-    "\"paths_explored\" : "      ^ (string_of_int !iterations)    ^ ", " ^
-    "\"solver_counter\" : "      ^ (string_of_int !solver_cnt)    ^ ", " ^
-    "\"instruction_counter\" : " ^ (string_of_int !step_cnt)      ^ ", " ^
-    "\"incomplete\" : "          ^ (string_of_bool !incomplete)   ^
-  "}"
-  in Io.save_file (Filename.concat !Flags.output "report.json") fmt_str;
-  !c.sym_code
-*)
+  !conf.sym_code
 
 let random_search
     (c : sym_config ref)
