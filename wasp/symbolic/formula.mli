@@ -11,7 +11,7 @@ type formula =
 type t = formula
 
 val negate : formula -> formula
-val conjuct : formula list -> formula
+val conjunct : formula list -> formula
 val length : formula -> int
 
 val to_formula : sym_expr list -> formula

@@ -113,7 +113,6 @@ exception Unsatisfiable
 
 let lines_to_ignore = ref 0
 
-let assumes    = ref []
 let step_cnt   = ref 0
 let solver_cnt = ref 0
 let iterations = ref 0
@@ -489,7 +488,7 @@ let rec sym_step (c : sym_config) : sym_config =
           | ex' ->
             let c = Option.map negate_relop (to_constraint ex') in
             let pc' = Option.map_default (fun a -> a :: pc) pc c in
-            let assertion = Formula.to_formula (!assumes @ pc') in
+            let assertion = Formula.to_formula pc' in
             let model = timed_check_sat assertion in
             match model with
             | None   -> []
@@ -521,7 +520,13 @@ let rec sym_step (c : sym_config) : sym_config =
           let assertion = Formula.to_formula pc' in
           let model = timed_check_sat assertion in
           let vs'', es', pc'' = match model with
-            | None -> vs', [Interrupt (AsmFail pc') @@ e.at], (Option.map_default (fun a -> a :: pc) pc (Option.map negate_relop cond))
+            | None ->
+              let c = Option.map negate_relop cond in
+              let pc_fls = Option.map_default (fun a -> a :: pc) pc c in
+              Option.map_default (fun a ->
+                record_branch pc_fls;
+                push_new_path (add_constraint a pc false)) () cond;
+              vs', [Interrupt (AsmFail pc') @@ e.at], pc_fls
             | Some m ->
               let li32 = Logicenv.get_vars_by_type I32Type logic_env
               and li64 = Logicenv.get_vars_by_type I64Type logic_env
@@ -541,12 +546,7 @@ let rec sym_step (c : sym_config) : sym_config =
 
       | SymAssume, (I32 i, ex) :: vs' ->
         let cond = to_constraint (simplify ex) in
-        let pc' =
-          if false then (
-              assumes := Option.map_default (fun a -> a :: !assumes) !assumes cond;
-              pc
-          ) else Option.map_default (fun a -> a :: pc) pc cond
-        in
+        let pc' = Option.map_default (fun a -> a :: pc) pc cond in
         record_branch pc';
         debug ">>> Assume passed. Continuing execution...";
         vs', [], logic_env, pc', mem
@@ -651,8 +651,8 @@ let rec sym_step (c : sym_config) : sym_config =
         let cv = I32 (if c = 0l then r0c else r1c) in
         let branch = to_constraint (simplify s) in
         let var = to_symbolic (Values.type_of cv) x in
-        let v =
-          if Option.is_none branch then (cv, if c = 0l then r0s else r1s)
+        let v, pc' =
+          if Option.is_none branch then (cv, if c = 0l then r0s else r1s), pc
           else (
             let branch = Option.get branch in
             let eq'  = I32Relop (Si32.I32Eq, var, r1s) in
@@ -661,11 +661,10 @@ let rec sym_step (c : sym_config) : sym_config =
             let imp  = I32Binop (Si32.I32Or, branch, eq) in
             let cond = I32Relop (Si32.I32Eq,
               I32Binop (Si32.I32And, imp', imp), Value (I32 1l)) in
-            assumes := cond :: !assumes;
             Logicenv.add logic_env x cv;
-            (cv, var)
+            (cv, var), cond :: pc
           )
-        in v :: vs', [], logic_env, pc, mem
+        in v :: vs', [], logic_env, pc', mem
 
       | PrintStack, vs' ->
         debug ("STACK STATE: " ^ (string_of_sym_value vs'));
@@ -837,9 +836,14 @@ let get_reason error : string =
     "\"line\" : \"" ^ region_str ^ "\"" ^
   "}"
 
-let write_test_case out_dir fmt test_data cnt : unit =
-  if not (test_data = "[]") then 
-    Io.save_file (Printf.sprintf fmt out_dir (cnt ())) test_data
+let write_test_case out_dir test_data is_witness cnt : unit =
+  if not (test_data = "[]") then (
+    let i = cnt () in
+    let filename =
+      if is_witness then Printf.sprintf "%s/witness_%05d.json" out_dir i
+      else Printf.sprintf "%s/test_%05d.json" out_dir i
+    in Io.save_file filename test_data
+  )
 
 let write_report spec reason witness coverage loop_time : unit =
   let report_str = "{" ^
@@ -883,7 +887,10 @@ let update_config model logic_env c inst mem glob code =
   Instance.set_globals !inst glob;
   {c with sym_budget=100000; sym_code=code; path_cond=[]}
 
-let guided_search conf inst test_suite =
+let guided_search 
+    (conf : sym_config ref)
+    (inst : module_inst ref)
+    (test_suite : string) =
   (* Save initial module configs *)
   let test_cntr = count 1
   and ini_mem  = Symmem2.to_list !inst.sym_memory
@@ -907,10 +914,7 @@ let guided_search conf inst test_suite =
       | e -> raise e
     in iterations := !iterations + 1;
     let testcase = Logicenv.(to_json (to_list lenv)) in
-    if Option.is_some !err then 
-      write_test_case test_suite "%s/witness_%05d.json" testcase test_cntr
-    else
-      write_test_case test_suite "%s/test_%05d.json" testcase test_cntr;
+    write_test_case test_suite testcase (Option.is_some !err) test_cntr;
     if Option.is_some !err then (
       incomplete := true;
       false, get_reason (Option.get !err), testcase
@@ -933,119 +937,84 @@ let guided_search conf inst test_suite =
   !conf.sym_code
 
 let random_search
-    (c : sym_config ref)
+    (conf : sym_config ref)
     (inst : module_inst ref)
     (test_suite : string) =
-  (* Initial memory config *)
-  let test_cntr = count 1
-  and init_mem  = Symmem2.to_list !inst.sym_memory
-  and init_glob = Global.contents !inst.globals
-  and init_code = !c.sym_code
-  and finish_constraints = Constraints.create
-  in (* Concolic execution *)
-  let rec loop global_pc =
-    debug ((String.make 35 '~') ^ " ITERATION NUMBER " ^
-        (string_of_int !iterations) ^ " " ^ (String.make 35 '~') ^ "\n");
-    let {logic_env; path_cond = pc; _} = try sym_eval !c with
-      | InstrLimit c' ->
-          let {logic_env; _} = c' in
-          let assignments = Logicenv.(to_json (to_list logic_env)) in
-          write_test_case test_suite "%s/test_%05d.json" assignments test_cntr;
-          raise Unsatisfiable
-      | AssumeFail (c', cons) ->
-          Constraints.add finish_constraints !iterations cons;
-          c' 
-      | AssertFail (c', at) ->
-          let {logic_env = lenv; _} = c' in
-          let wit = Logicenv.(to_json (to_list lenv)) in
-          debug ("\n" ^ (string_of_region at) ^ ": Assertion Failure\n" ^ wit);
-          if not !Flags.branches then raise (AssertFail (c', at))
-                  else c'
+  let test_cnt = count 1
+  and ini_mem  = Symmem2.to_list !inst.sym_memory
+  and ini_glob = Global.contents !inst.globals
+  and ini_code = !conf.sym_code
+  and assume_fails = Constraints.create
+  and finish = ref false and error = ref None in
+  let rec loop global_pc c =
+    if !Flags.trace then ((* Debug *)
+      let curly = String.make 35 '~' in
+      Printf.printf "%s ITERATION NUMBER %03d %s\n\n"
+        curly (!iterations + 1) curly
+    );
+    let {logic_env; path_cond = pc; _} = try sym_eval c with
+      | InstrLimit c'            -> finish:= true; c'
+      | AssumeFail (c', pc)      ->
+          Constraints.add assume_fails !iterations pc; c'
+      | AssertFail (c', at)      -> error := Some ("Assertion Failure", at); c'
+      | BugException (c', at, b) -> error := Some (string_of_bug b, at); c'
       | e -> raise e
     in iterations := !iterations + 1;
     let testcase = Logicenv.(to_json (to_list logic_env)) in
-    write_test_case test_suite "%s/test_%05d.json" testcase test_cntr;
-    if (!iterations = 1) && (pc = []) && (!assumes = []) then
-      raise Unsatisfiable;
-
-    (* write current model as a test *)
-
-   (* DEBUG: *)
-    let delim = String.make 6 '$' in
-    if !Flags.trace then (
-      debug ("\n\n" ^ delim ^ " LOGICAL ENVIRONMENT BEFORE Z3 STATE " ^ delim ^
-           "\n" ^ (Logicenv.to_string logic_env) ^ (String.make 48 '$') ^ "\n");
-      debug ("\n\n" ^ delim ^ " PATH CONDITIONS BEFORE Z3 " ^ delim ^
-        "\n" ^ (pp_string_of_pc pc) ^ "\n" ^ (String.make 38 '$'));
-    );
-
-    let pc' = if not (pc = []) then Formula.(negate (to_formula pc))
-                               else Formula.True in
-    let global_pc' = Globalpc.add (Formula.to_string pc') pc' global_pc in
-    let assumes' = List.map (fun e -> Formula.Relop e) !assumes in
-    let global_pc' = List.fold_left
-      (fun a b -> Globalpc.add (Formula.to_string b) b a) global_pc' assumes' in
-
-    let bindings = List.map (fun (_, f) -> f) (Globalpc.bindings global_pc') in
-    let formula = (Formula.conjuct bindings) in
-
-    if !Flags.trace then
-      debug ("\n\n" ^ delim ^ " GLOBAL PATH CONDITION " ^ delim ^ "\n" ^
-            (Formula.pp_to_string formula) ^ "\n" ^ (String.make 28 '$') ^ "\n");
-    let prev_time = !solver_time in
-    let opt_model = timed_check_sat formula in
-    let model = try Option.get opt_model with _ ->
-      raise Unsatisfiable in
-    c := update_config model logic_env !c inst init_mem init_glob init_code;
-
-    if !Flags.trace then (
-      let formula_len = Formula.length formula in
-      let z3_model_str = Z3.Model.to_string model in
-      debug ("SATISFIABLE\nMODEL: \n" ^ z3_model_str ^ "\n\n\n" ^ 
-            delim ^ " NEW LOGICAL ENV STATE " ^ delim ^ "\n" ^
-           (Logicenv.to_string logic_env) ^ (String.make 28 '$') ^ "\n");
-      debug ("\n" ^ (String.make 23 '-') ^ " ITERATION " ^
-            (string_of_int !iterations) ^ " STATISTICS: " ^ (String.make 23 '-'));
-      debug ("PATH CONDITION SIZE: " ^ (string_of_int (Formula.length pc')));
-      debug ("GLOBAL PATH CONDITION SIZE: " ^ (string_of_int formula_len));
-      debug ("TIME TO SOLVE GLOBAL PC: " ^ (string_of_float (!solver_time -. prev_time)) ^ "\n" ^
-            (String.make 73 '-') ^ "\n\n");
-      debug ((String.make 92 '~') ^ "\n");
-    );
-    loop global_pc'
-  in
-  debug ((String.make 92 '~') ^ "\n");
-  let global_pc = Globalpc.add "True" Formula.True Globalpc.empty in
+    write_test_case test_suite testcase (Option.is_some !error) test_cnt;
+    if Option.is_some !error then (
+      incomplete := true;
+      false, get_reason (Option.get !error), testcase
+    ) else if !finish || (!iterations = 1 && pc = []) then (
+      true, "{}", "[]"
+    ) else (
+      let pc' = if not (pc = []) then Formula.(negate (to_formula pc))
+                                 else Formula.True in
+      let global_pc' = Globalpc.add (Formula.to_string pc') pc' global_pc in
+      let bindings = List.map (fun (_, f) -> f) (Globalpc.bindings global_pc') in
+      let formula = Formula.conjunct bindings in
+      if !Flags.trace then ((* Debug *)
+        let delim = String.make 6 '$' in
+        Printf.printf "\n\n%s LOGICAL ENVIRONMENT BEFORE Z3 STATE %s\n%s%s\n\n"
+          delim delim (Logicenv.to_string logic_env) (String.make 48 '$');
+        Printf.printf "\n\n%s PATH CONDITIONS BEFORE Z3 %s\n%s\n%s\n"
+          delim delim (pp_string_of_pc pc) (String.make 38 '$');
+        Printf.printf "\n\n%s GLOBAL PATH CONDITION %s\n%s\n%s\n\n"
+          delim delim (Formula.pp_to_string formula) (String.make 28 '$');
+      );
+      let prev_time = !solver_time in
+      match timed_check_sat formula with
+      | None   -> true, "{}", "[]"
+      | Some m ->
+          let c' = update_config m logic_env c inst ini_mem ini_glob ini_code in
+          if !Flags.trace then ((* Debug *)
+            let delim = String.make 6 '$' in
+            Printf.printf "SATISFIABLE\nMODEL:\n%s\n"
+              (Z3.Model.to_string m);
+            Printf.printf "\n\n%s NEW LOGICAL ENV STATE %s\n%s%s\n\n"
+              delim delim (Logicenv.to_string logic_env) (String.make 28 '$');
+            Printf.printf "\n%s ITERATION %03d STATISTICS: %s\n"
+              (String.make 23 '-') !iterations (String.make 23 '-');
+            Printf.printf "PC SIZE: %d\n" (Formula.length pc');
+            Printf.printf "GLOBAL PC SIZE: %d\n" (Formula.length formula);
+            Printf.printf "TIME TO SOLVE GLOBAL PC: %f\n"
+              (!solver_time -. prev_time);
+            Printf.printf "%s\n\n\n%s\n\n"
+              (String.make 73 '-') (String.make 92 '~');
+          );
+          loop global_pc' c'
+    )
+  in 
   loop_start := Sys.time ();
-  let spec, reason, wit = try loop global_pc with
-    | Unsatisfiable ->
-        debug "Model is no longer satisfiable. All paths have been verified.\n";
-        true, "{}", "[]"
-    | AssertFail (c', r) ->
-        incomplete := true;
-        let {logic_env = lenv; _} = c' in
-        let wit = Logicenv.(to_json (to_list lenv)) in
-        write_test_case test_suite "%s/witness_%05d.json" wit test_cntr;
-        false, get_reason ("Assertion Failure", r), wit
-    | BugException (c', r, b) ->
-        incomplete := true;
-        let {logic_env = lenv; _} = c' in
-        let wit = Logicenv.(to_json (to_list lenv)) in
-        write_test_case test_suite "%s/witness_%05d.json" wit test_cntr;
-        false, get_reason (string_of_bug b, r), wit
-    | e -> raise e
-  in
+  let global_pc = Globalpc.add "True" Formula.True Globalpc.empty in
+  let spec, reason, witness = loop global_pc !conf in
   let loop_time = (Sys.time ()) -. !loop_start in
-  (* DEBUG: *)
-  debug ("\n\n>>>> END OF CONCOLIC EXECUTION. ASSUME FAILS WHEN:\n" ^
-      (Constraints.to_string finish_constraints) ^ "\n");
-
   let n_lines = List.((length !inst.types) + (length !inst.tables) +
                       (length !inst.memories) + (length !inst.globals) +
                       (length !inst.exports) + 1) in
   let coverage = (Coverage.calculate_cov inst (n_lines + !lines_to_ignore)) *. 100.0 in
-  write_report spec reason wit coverage loop_time;
-  !c.sym_code
+  write_report spec reason witness coverage loop_time;
+  !conf.sym_code
 
 let sym_invoke' (func : func_inst) (vs : sym_value list) : sym_value list =
   (* Prepare workspace *)
