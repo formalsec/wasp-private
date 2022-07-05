@@ -55,8 +55,11 @@ let rec length (e : formula) : int =
   | And (c1, c2) -> 1 + (length c1) + (length c2)
   | Or  (c1, c2) -> 1 + (length c1) + (length c2)
 
+let to_formulas (pc : sym_expr list) : formula list =
+  List.map (fun e -> Relop e) pc
+
 let to_formula (pc : sym_expr list) : formula =
-  conjunct (List.map (fun e -> Relop e) pc)
+  conjunct (to_formulas pc)
 
 let rec get_vars (e : formula) : (string * symbolic) list =
   match e with

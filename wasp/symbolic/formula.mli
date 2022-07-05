@@ -14,6 +14,7 @@ val negate : formula -> formula
 val conjunct : formula list -> formula
 val length : formula -> int
 
+val to_formulas : sym_expr list -> formula list
 val to_formula : sym_expr list -> formula
 val to_string : formula -> string
 val pp_to_string : formula -> string

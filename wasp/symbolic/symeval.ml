@@ -228,9 +228,9 @@ let instr_str e =
     | Convert op -> "convert"
     | _ -> "not support"
 
-let timed_check_sat formula =
+let timed_check_sat formulas =
   let start = Sys.time () in
-  let opt_model = Z3Encoding2.check_sat_core formula in
+  let opt_model = Z3Encoding2.check_sat_core formulas in
   let delta = (Sys.time ()) -. start in
   solver_time := !solver_time +. delta;
   solver_cnt := !solver_cnt + 1;
@@ -559,8 +559,8 @@ struct
           let es' =
             if is_concrete (simplify ex) then []
             else (
-              let formula = pc.assumptions @ (add_constraint ex pc.branches true) in
-              match timed_check_sat (Formula.to_formula formula) with
+              let formulas = pc.assumptions @ (add_constraint ex pc.branches true) in
+              match timed_check_sat (Formula.to_formulas formulas) with
               | None   -> []
               | Some m ->
                 let li32 = Logicenv.get_vars_by_type I32Type logic_env
@@ -584,8 +584,8 @@ struct
             vs', [Interrupt (AsmFail pc'.branches) @@ e.at], logic_env, pc', mem
           ) else (
             let pc' = pc.assumptions @ (add_constraint ex pc.branches false) in
-            let formula = Formula.to_formula pc' in
-            let vs'', es', pc'' = match timed_check_sat formula with
+            let formulas = Formula.to_formulas pc' in
+            let vs'', es', pc'' = match timed_check_sat formulas with
               | None ->
                 let _ = branch_on_cond false ex pc in
                 let pc_fls = {pc with branches = add_constraint ex pc.branches true} in
@@ -923,7 +923,7 @@ struct
     and finish = ref false and err = ref None in
     let rec find_sat_pc pcs =
       if P.is_empty pcs then None
-      else match timed_check_sat (Formula.to_formula (P.pop pcs)) with
+      else match timed_check_sat (Formula.to_formulas (P.pop pcs)) with
       | None   -> find_sat_pc pcs
       | Some m -> Some m
     in
@@ -997,10 +997,10 @@ struct
                                                 else Formula.True in
         let global_pc' = M.add (Formula.to_string asm') asm' global_pc |>
           M.add (Formula.to_string pc') pc' in
-        let bindings = List.map (fun (_, f) -> f) (M.bindings global_pc') in
-        let formula = Formula.conjunct bindings in
+        let formulas = List.map (fun (_, f) -> f) (M.bindings global_pc') in
         if !Flags.trace then ((* Debug *)
           let delim = String.make 6 '$' in
+          let formula = Formula.conjunct formulas in
           Printf.printf "\n\n%s LOGICAL ENVIRONMENT BEFORE Z3 STATE %s\n%s%s\n\n"
             delim delim (Logicenv.to_string logic_env) (String.make 48 '$');
           Printf.printf "\n\n%s PATH CONDITIONS BEFORE Z3 %s\n%s\n%s\n"
@@ -1009,12 +1009,13 @@ struct
             delim delim (Formula.pp_to_string formula) (String.make 28 '$');
         );
         let prev_time = !solver_time in
-        match timed_check_sat formula with
+        match timed_check_sat formulas with
         | None   -> true, "{}", "[]"
         | Some m ->
             let c' = update_config m logic_env c inst ini_mem ini_glob ini_code in
             if !Flags.trace then ((* Debug *)
               let delim = String.make 6 '$' in
+              let formula = Formula.conjunct formulas in
               Printf.printf "SATISFIABLE\nMODEL:\n%s\n"
                 (Z3.Model.to_string m);
               Printf.printf "\n\n%s NEW LOGICAL ENV STATE %s\n%s%s\n\n"
