@@ -578,7 +578,7 @@ struct
         | SymAssume, (I32 0l, ex) :: vs' ->
           debug (">>> Assumed false {line> " ^ (Source.string_of_pos e.at.left) ^
             "}. Finishing...");
-          if not !Flags.smt_assume then (
+          if (not !Flags.smt_assume) || is_concrete (simplify ex) then (
             let _ = branch_on_cond false ex pc in
             let pc' = {pc with branches = add_constraint ex pc.branches true} in
             vs', [Interrupt (AsmFail pc'.branches) @@ e.at], logic_env, pc', mem
