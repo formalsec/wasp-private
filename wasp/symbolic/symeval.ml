@@ -928,13 +928,14 @@ struct
       | Some m -> Some m
     in
     let rec loop c =
+      iterations := !iterations + 1; tree := head;
       let {logic_env = lenv; _} = try sym_eval c with
         | InstrLimit c'            -> finish := true; c'
-        | AssumeFail (c', _)       -> c'
+        | AssumeFail (c', _)       -> iterations := !iterations - 1; c'
         | AssertFail (c', at)      -> err := Some ("Assertion Failure", at); c'
         | BugException (c', at, b) -> err := Some (string_of_bug b, at); c'
         | e -> raise e
-      in iterations := !iterations + 1; tree := head;
+      in
       let testcase = Logicenv.(to_json (to_list lenv)) in
       write_test_case test_suite testcase (Option.is_some !err) test_cntr;
       if Option.is_some !err then (
@@ -975,14 +976,16 @@ struct
         Printf.printf "%s ITERATION NUMBER %03d %s\n\n"
           curly (!iterations + 1) curly
       );
+      iterations := !iterations + 1;
       let {logic_env; path_cond = pc; _} = try sym_eval c with
         | InstrLimit c'            -> finish:= true; c'
         | AssumeFail (c', pc)      ->
+            iterations := !iterations - 1;
             Constraints.add assume_fails !iterations pc; c'
         | AssertFail (c', at)      -> error := Some ("Assertion Failure", at); c'
         | BugException (c', at, b) -> error := Some (string_of_bug b, at); c'
         | e -> raise e
-      in iterations := !iterations + 1;
+      in
       let testcase = Logicenv.(to_json (to_list logic_env)) in
       write_test_case test_suite testcase (Option.is_some !error) test_cnt;
       if Option.is_some !error then (
