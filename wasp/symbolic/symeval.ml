@@ -40,7 +40,7 @@ let numeric_error at = function
   | exn -> raise exn
 
 
-type policy = Random | Depth | Breadth
+type policy = Random | Depth | Breadth | Coverage
 
 type bug =
   | Overflow
@@ -142,10 +142,11 @@ let count (init : int) : (unit -> int)=
 
 let parse_policy (p : string) : policy option =
   match p with
-  | "random"  -> Some Random
-  | "depth"   -> Some Depth
-  | "breadth" -> Some Breadth
-  | _         -> None
+  | "random"   -> Some Random
+  | "depth"    -> Some Depth
+  | "breadth"  -> Some Breadth
+  | "coverage" -> Some Coverage
+  | _          -> None
 
 let string_of_bug : (bug -> string) = function
   | Overflow -> "Overflow"
@@ -156,7 +157,7 @@ let plain e = SPlain e.it @@ e.at
 
 let lookup category list x =
   try Lib.List32.nth list x.it with Failure _ ->
-    Crash.error x.at ("undefined " ^ category ^ " " ^ Int32.to_string x.it)
+    Crash.error x.at ("undefined " ^ category ^ " " ^ Int32.to_string x.it) 
 
 let type_ (inst : module_inst) x = lookup "type" inst.types x
 let func (inst : module_inst) x = lookup "function" inst.funcs x
@@ -292,8 +293,7 @@ sig
   val is_empty : 'a t -> bool
 end
 
-module Search (P : Paths) 
-              (M : Map.S with type key = String.t) =
+module Search (P : Paths) =
 struct
   type tree =
     | Leaf
@@ -912,7 +912,7 @@ struct
     Instance.set_globals !inst glob;
     {c with sym_budget=100000; sym_code=code; path_cond=path_cond [] []}
 
-  let guided_search
+  let run
       (conf : sym_config ref)
       (inst : module_inst ref)
       (test_suite : string) =
@@ -959,11 +959,12 @@ struct
     write_report spec reason witness coverage loop_time;
     !conf.sym_code
 
-  let random_search
+  let run_random
       (conf : sym_config ref)
       (inst : module_inst ref)
       (test_suite : string) =
     rand := true;
+    let module PCMap = Map.Make(String) in
     let test_cnt = count 1
     and ini_mem  = Symmem2.to_list !inst.sym_memory
     and ini_glob = Global.contents !inst.globals
@@ -994,13 +995,13 @@ struct
       ) else if !finish || (!iterations = 1 && pc.branches = []) then (
         true, "{}", "[]"
       ) else (
-        let pc' = if not (pc.branches = []) then Formula.(negate (to_formula pc.branches))
-                                            else Formula.True in
-        let asm' = if not (pc.assumptions = []) then Formula.to_formula pc.assumptions
-                                                else Formula.True in
-        let global_pc' = M.add (Formula.to_string asm') asm' global_pc |>
-          M.add (Formula.to_string pc') pc' in
-        let formulas = List.map (fun (_, f) -> f) (M.bindings global_pc') in
+        let pc' = if pc.branches <> [] then Formula.(negate (to_formula pc.branches))
+                                       else Formula.True in
+        let asm' = if pc.assumptions <> [] then Formula.to_formula pc.assumptions
+                                           else Formula.True in
+        let global_pc' = PCMap.add (Formula.to_string asm') asm' global_pc |>
+          PCMap.add (Formula.to_string pc') pc' in
+        let formulas = List.map (fun (_, f) -> f) (PCMap.bindings global_pc') in
         if !Flags.trace then ((* Debug *)
           let delim = String.make 6 '$' in
           let formula = Formula.conjunct formulas in
@@ -1037,7 +1038,7 @@ struct
     in 
     loop_start := Sys.time ();
     let spec, reason, witness =
-      M.add "True" Formula.True M.empty |> loop !conf in
+      PCMap.add "True" Formula.True PCMap.empty |> loop !conf in
     let loop_time = (Sys.time ()) -. !loop_start in
     let n_lines = List.((length !inst.types) + (length !inst.tables) +
                         (length !inst.memories) + (length !inst.globals) +
@@ -1045,12 +1046,10 @@ struct
     let coverage = (Coverage.calculate_cov inst (n_lines + !lines_to_ignore)) *. 100.0 in
     write_report spec reason witness coverage loop_time;
     !conf.sym_code
-
 end
 
-module Globalpc = Map.Make(String)
-module DepthFirstSearch   = Search(Stack)(Globalpc)
-module BreadthFirstSearch = Search(Queue)(Globalpc)
+module DepthFirstSearch   = Search(Stack)
+module BreadthFirstSearch = Search(Queue)
 
 let sym_invoke' (func : func_inst) (vs : sym_value list) : sym_value list =
   (* Prepare workspace *)
@@ -1068,9 +1067,10 @@ let sym_invoke' (func : func_inst) (vs : sym_value list) : sym_value list =
   let p = parse_policy !Flags.policy in
   let f = match p with
     | None -> Crash.error at "wrong search policy provided."
-    | Some Random  -> DepthFirstSearch.random_search
-    | Some Depth   -> DepthFirstSearch.guided_search
-    | Some Breadth -> BreadthFirstSearch.guided_search
+    | Some Random  -> DepthFirstSearch.run_random
+    | Some Depth   -> DepthFirstSearch.run
+    | Some Breadth -> BreadthFirstSearch.run
+    | Some Coverage -> BreadthFirstSearch.run
   in
   let (vs, _) = f c inst test_suite in
   try List.rev vs with Stack_overflow ->
