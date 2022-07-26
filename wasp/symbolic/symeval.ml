@@ -1048,8 +1048,90 @@ struct
     !conf.sym_code
 end
 
+module PQueue =
+struct
+  type 'a order = 'a -> 'a -> int
+
+  type 'a t = {
+    mutable     size : int;
+    mutable capacity : int;
+    mutable     heap : 'a array;
+               order : 'a order;
+  }
+
+  exception Empty
+
+
+  let make order =
+    { size = 0; capacity = 8; heap = Array.make 8 (Obj.magic 0); order = order }
+
+  let create () = 
+    { size = 0; capacity = 8; heap = Array.make 8 (Obj.magic 0); order = compare }
+
+  let length h = h.size
+
+  let is_empty h = h.size = 0
+
+  let expand_capacity h =
+    let capacity' = min (h.capacity * 2) Sys.max_array_length in
+    if h.size = capacity' then failwith "maximum capacity reached";
+    let heap' = Array.make capacity' (Obj.magic 0) in
+    Array.blit h.heap 0 heap' 0 h.size;
+    h.heap <- heap';
+    h.capacity <- capacity'
+
+  let parent i = (i - 1) / 2
+  let left   i = 2 * i + 1
+  let right  i = 2 * i + 2
+
+  let push x h =
+    let i = length h in
+    if i = h.capacity then expand_capacity h;
+    h.heap.(i)  <- x;
+    h.size <- i + 1;
+    let rec moveup i =
+      let ord = h.order in
+      let pi = parent i in
+      if i <> 0 && ord h.heap.(pi) x < 0 then (
+        let tmp = h.heap.(i) in
+        h.heap.(i) <- h.heap.(pi);
+        h.heap.(pi) <- tmp;
+        moveup pi
+      )
+    in moveup i
+
+  let top h =
+    if length h = 0 then raise Empty;
+    h.heap.(0)
+
+  let pop h =
+    let n = length h in
+    if n = 0 then raise Empty;
+    let m = h.heap.(0) in
+    h.heap.(0) <- h.heap.(n - 1);
+    h.heap.(n - 1) <- m;
+    h.size <- n - 1;
+    let rec heapify i =
+      let ord = h.order in
+      let li = left i in
+      let ri = right i in
+      if h.size > 1 && li < h.size && ri < h.size then (
+        let i' = if ord h.heap.(ri) h.heap.(li) > 0 then ri else li
+        in
+        if ord h.heap.(i') h.heap.(i) > 0 then (
+          let tmp = h.heap.(i) in
+          h.heap.(i) <- h.heap.(i');
+          h.heap.(i') <- tmp;
+          heapify i'
+        )
+      )
+    in heapify 0;
+    m
+end
+
 module DepthFirstSearch   = Search(Stack)
 module BreadthFirstSearch = Search(Queue)
+module PrioritySearch     = Search(PQueue)
 
 let sym_invoke' (func : func_inst) (vs : sym_value list) : sym_value list =
   (* Prepare workspace *)
@@ -1070,7 +1152,7 @@ let sym_invoke' (func : func_inst) (vs : sym_value list) : sym_value list =
     | Some Random  -> DepthFirstSearch.run_random
     | Some Depth   -> DepthFirstSearch.run
     | Some Breadth -> BreadthFirstSearch.run
-    | Some Coverage -> BreadthFirstSearch.run
+    | Some Coverage -> PrioritySearch.run
   in
   let (vs, _) = f c inst test_suite in
   try List.rev vs with Stack_overflow ->
