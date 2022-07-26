@@ -283,6 +283,121 @@ let set_timeout (time_limit : int) : unit =
     ignore (Unix.alarm time_limit)
   )
 
+let update_config model lenv c inst mem glob code chk_tbl =
+  let li32 = Logicenv.get_vars_by_type I32Type lenv
+  and li64 = Logicenv.get_vars_by_type I64Type lenv
+  and lf32 = Logicenv.get_vars_by_type F32Type lenv
+  and lf64 = Logicenv.get_vars_by_type F64Type lenv in
+  let binds = Z3Encoding2.lift_z3_model model li32 li64 lf32 lf64 in
+  Hashtbl.reset chk_tbl;
+  Logicenv.reset lenv;
+  Logicenv.init lenv binds;
+  Symmem2.clear c.sym_mem;
+  Symmem2.init c.sym_mem mem;
+  Instance.set_globals !inst glob;
+  {c with sym_budget=100000; sym_code=code; path_cond=path_cond [] []}
+
+let rec eval
+    (c : sym_config)
+    (stepper : sym_config -> sym_config) : sym_config =
+  match c.sym_code with
+  | vs, [] ->
+    c
+
+  | vs, {it = STrapping msg; at} :: _ ->
+    Trap.error at msg
+
+  | vs, {it = Interrupt i; at} :: es ->
+    let exn = match i with
+      | IntLimit   -> InstrLimit c
+      | AsmFail pc -> AssumeFail ({c with sym_code = vs, es}, pc)
+      | AssFail pc -> AssertFail (c, at)
+      | Bug b      -> BugException (c, at, b)
+    in raise exn
+
+  | vs, es ->
+    eval (stepper c) stepper
+
+module PQueue =
+struct
+  type 'a order = 'a -> 'a -> int
+
+  type 'a t = {
+    mutable     size : int;
+    mutable capacity : int;
+    mutable     heap : 'a array;
+               order : 'a order;
+  }
+
+  exception Empty
+
+  let make order =
+    { size = 0; capacity = 8; heap = Array.make 8 (Obj.magic 0); order = order }
+
+  let create () = 
+    { size = 0; capacity = 8; heap = Array.make 8 (Obj.magic 0); order = compare }
+
+  let length h = h.size
+
+  let is_empty h = h.size = 0
+
+  let expand_capacity h =
+    let capacity' = min (h.capacity * 2) Sys.max_array_length in
+    if h.size = capacity' then failwith "maximum capacity reached";
+    let heap' = Array.make capacity' (Obj.magic 0) in
+    Array.blit h.heap 0 heap' 0 h.size;
+    h.heap <- heap';
+    h.capacity <- capacity'
+
+  let parent i = (i - 1) / 2
+  let left   i = 2 * i + 1
+  let right  i = 2 * i + 2
+
+  let push x h =
+    let i = length h in
+    if i = h.capacity then expand_capacity h;
+    h.heap.(i)  <- x;
+    h.size <- i + 1;
+    let rec moveup i =
+      let ord = h.order in
+      let pi = parent i in
+      if i <> 0 && ord h.heap.(pi) x < 0 then (
+        let tmp = h.heap.(i) in
+        h.heap.(i) <- h.heap.(pi);
+        h.heap.(pi) <- tmp;
+        moveup pi
+      )
+    in moveup i
+
+  let top h =
+    if length h = 0 then raise Empty;
+    h.heap.(0)
+
+  let pop h =
+    let n = length h in
+    if n = 0 then raise Empty;
+    let m = h.heap.(0) in
+    h.heap.(0) <- h.heap.(n - 1);
+    h.heap.(n - 1) <- m;
+    h.size <- n - 1;
+    let rec heapify i =
+      let ord = h.order in
+      let li = left i in
+      let ri = right i in
+      if h.size > 1 && li < h.size && ri < h.size then (
+        let i' = if ord h.heap.(ri) h.heap.(li) > 0 then ri else li
+        in
+        if ord h.heap.(i') h.heap.(i) > 0 then (
+          let tmp = h.heap.(i) in
+          h.heap.(i) <- h.heap.(i');
+          h.heap.(i') <- tmp;
+          heapify i'
+        )
+      )
+    in heapify 0;
+    m
+end
+
 module type Paths =
 sig
   type 'a t
@@ -293,57 +408,20 @@ sig
   val is_empty : 'a t -> bool
 end
 
-module Search (P : Paths) =
+module RandomSearch =
 struct
-  type tree =
-    | Leaf
-    | Node of tree ref * tree ref
-
-  (* Execution tracing *)
-  let head = ref Leaf
-  let tree = ref head
-  let to_explore = P.create ()
 
   (* Tracks malloc chunks (loc, size) *)
-  let chunk_table = Hashtbl.create 512
+  let chk_tbl = Hashtbl.create 512
 
-  (* Flags *)
-  let rand = ref false
-
-  let move_true (t : tree ref) : tree ref * bool =
-    match !t with
-    | Leaf ->
-      let rt = ref Leaf and rf = ref Leaf in
-      t := Node (rt, rf);
-      rt, true
-    | Node (rt, rf) -> rt, false
-
-  let move_false (t : tree ref) : tree ref * bool =
-    match !t with
-    | Leaf ->
-      let rt = ref Leaf and rf = ref Leaf in
-      t := Node (rt, rf);
-      rf, true
-    | Node (rt, rf) -> rf, false
-
-  let branch_on_cond bval c pc : unit =
-    let c' = simplify c in
-    if not (!rand || is_concrete c') then (
-      let tree', to_branch = if bval then move_true !tree
-                                     else move_false !tree in
-      tree := tree';
-      let pc' = pc.assumptions @ pc.branches in
-      if to_branch then P.push (add_constraint c pc' bval) to_explore
-    )
-
-  (*  Symbolic step  *)
-  let rec sym_step (c : sym_config) : sym_config =
+  let rec step (c : sym_config) : sym_config =
     step_cnt := !step_cnt + 1;
     let {
       sym_frame = frame;
-      sym_code = vs, es;
-      logic_env; path_cond = pc;
-      sym_mem = mem;
+      sym_code  = vs, es;
+      logic_env = logic_env;
+      path_cond = pc;
+      sym_mem   = mem;
       _
     } = c in
     let e = List.hd es in
@@ -368,27 +446,22 @@ struct
           vs, [SLabel (0, [e' @@ e.at], ([], List.map plain es')) @@ e.at], logic_env, pc, mem
 
         | If (ts, es1, es2), (I32 0l, ex) :: vs' ->
-          let _ = branch_on_cond false ex pc in
-          let pc' = {pc with branches = add_constraint ex pc.branches true} in
+          let pc' = { pc with branches = add_constraint ~neg:true ex pc.branches } in
           vs', [SPlain (Block (ts, es2)) @@ e.at], logic_env, pc', mem
 
         | If (ts, es1, es2), (I32 i, ex) :: vs' ->
-          let _ = branch_on_cond true ex pc in
-          let pc' = {pc with branches = add_constraint ex pc.branches false} in
+          let pc' = { pc with branches = add_constraint ex pc.branches } in
           vs', [SPlain (Block (ts, es1)) @@ e.at], logic_env, pc', mem
 
         | Br x, vs ->
           [], [SBreaking (x.it, vs) @@ e.at], logic_env, pc, mem
 
         | BrIf x, (I32 0l, ex) :: vs' ->
-          (* Negate expression because it is false *)
-          let _ = branch_on_cond false ex pc in
-          let pc' = {pc with branches = add_constraint ex pc.branches true} in
+          let pc' = { pc with branches = add_constraint ~neg:true ex pc.branches } in
           vs', [], logic_env, pc', mem
 
         | BrIf x, (I32 i, ex) :: vs' ->
-          let _ = branch_on_cond true ex pc in
-          let pc' = {pc with branches = add_constraint ex pc.branches false} in
+          let pc' = { pc with branches = add_constraint ex pc.branches } in
           vs', [SPlain (Br x) @@ e.at], logic_env, pc', mem
 
         | BrTable (xs, x), (I32 i, _) :: vs' when I32.ge_u i (Lib.List32.length xs) ->
@@ -414,13 +487,11 @@ struct
           vs', [], logic_env, pc, mem
 
         | Select, (I32 0l, ex) :: v2 :: v1 :: vs' ->
-          let _ = branch_on_cond false ex pc in
-          let pc' = {pc with branches = add_constraint ex pc.branches true} in
+          let pc' = { pc with branches = add_constraint ~neg:true ex pc.branches } in
           v2 :: vs', [], logic_env, pc', mem
 
         | Select, (I32 i, ex) :: v2 :: v1 :: vs' ->
-          let _ = branch_on_cond true ex pc in
-          let pc' = {pc with branches = add_constraint ex pc.branches false} in
+          let pc' = { pc with branches = add_constraint ex pc.branches } in
           v1 :: vs', [], logic_env, pc', mem
 
         | LocalGet x, vs ->
@@ -453,7 +524,7 @@ struct
             if Option.is_some ptr then begin
               let low = I32Value.of_value (Option.get ptr) in
               let chunk_size =
-                try Hashtbl.find chunk_table low
+                try Hashtbl.find chk_tbl low
                 with Not_found -> raise (BugException (c, e.at, UAF)) in
               let high = Int64.(add (of_int32 low) (of_int32 chunk_size))
               and ptr_val = Int64.(add base (of_int32 offset)) in
@@ -482,7 +553,7 @@ struct
             if Option.is_some ptr then begin
               let low = I32Value.of_value (Option.get ptr) in
               let chunk_size =
-                try Hashtbl.find chunk_table low
+                try Hashtbl.find chk_tbl low
                 with Not_found -> raise (BugException (c, e.at, UAF)) in
               let high = Int64.(add (of_int32 low) (of_int32 chunk_size))
               and ptr_val = Int64.(add base (of_int32 offset)) in
@@ -559,7 +630,7 @@ struct
           let es' =
             if is_concrete (simplify ex) then []
             else (
-              let formulas = pc.assumptions @ (add_constraint ex pc.branches true) in
+              let formulas = pc.assumptions @ (add_constraint ~neg:true ex pc.branches) in
               match timed_check_sat (Formula.to_formulas formulas) with
               | None   -> []
               | Some m ->
@@ -579,16 +650,671 @@ struct
           debug (">>> Assumed false {line> " ^ (Source.string_of_pos e.at.left) ^
             "}. Finishing...");
           if (not !Flags.smt_assume) || is_concrete (simplify ex) then (
-            let _ = branch_on_cond false ex pc in
-            let pc' = {pc with branches = add_constraint ex pc.branches true} in
+            let pc' = { pc with branches = add_constraint ~neg:true ex pc.branches } in
             vs', [Interrupt (AsmFail pc'.branches) @@ e.at], logic_env, pc', mem
           ) else (
-            let pc' = pc.assumptions @ (add_constraint ex pc.branches false) in
+            let pc' = pc.assumptions @ (add_constraint ex pc.branches) in
+            let formulas = Formula.to_formulas pc' in
+            let vs'', es', pc'' = match timed_check_sat formulas with
+              | None ->
+                let pc_fls = { pc with branches = add_constraint ~neg:true ex pc.branches } in
+                vs', [Interrupt (AsmFail pc') @@ e.at], pc_fls
+              | Some m ->
+                let li32 = Logicenv.get_vars_by_type I32Type logic_env
+                and li64 = Logicenv.get_vars_by_type I64Type logic_env
+                and lf32 = Logicenv.get_vars_by_type F32Type logic_env
+                and lf64 = Logicenv.get_vars_by_type F64Type logic_env in
+                let binds = Z3Encoding2.lift_z3_model m li32 li64 lf32 lf64 in
+                (* update logical environment *)
+                Logicenv.update logic_env binds;
+                (* update heap *)
+                Symmem2.update mem logic_env;
+                let f = (fun v -> let (_, s) = v in (Logicenv.eval logic_env s, s)) in
+                (* update locals *)
+                List.iter (fun a -> a := f !a) frame.sym_locals;
+                (* update stack *)
+                List.map f vs', [], {pc with branches = pc'}
+            in vs'', es', logic_env, pc'', mem)
+
+        | SymAssume, (I32 i, ex) :: vs' ->
+          debug ">>> Assume passed. Continuing execution...";
+          let pc' = { pc with branches = add_constraint ex pc.branches } in
+          vs', [], logic_env, pc', mem
+
+        | Symbolic (ty, b), (I32 i, _) :: vs' ->
+          let base = I64_convert.extend_i32_u i in
+          let x = Logicenv.next logic_env (Symmem2.load_string mem base) in
+          let v = Logicenv.get logic_env x ty b in
+          (v, to_symbolic ty x) :: vs', [], logic_env, pc, mem
+
+        | Boolop boolop, (v2, sv2) :: (v1, sv1) :: vs' ->
+          let sv2' = mk_relop sv2 (Values.type_of v2) in
+          let v2' = Values.(value_of_bool (not (v2 = default_value (type_of v2)))) in
+          let sv1' = mk_relop sv1 (Values.type_of v1) in
+          let v1' = Values.(value_of_bool (not (v1 = default_value (type_of v1)))) in
+          (try
+            let v3, sv3 = eval_binop (v1', sv1') (v2', sv2') boolop in
+            (v3, simplify sv3) :: vs', [], logic_env, pc, mem
+          with exn ->
+            vs', [STrapping (numeric_error e.at exn) @@ e.at], logic_env, pc, mem)
+
+        | Alloc, (I32 a, sa) :: (I32 b, sb) :: vs' ->
+            Hashtbl.add chk_tbl b a;
+            (I32 b, Ptr (I32 b)) :: vs', [], logic_env, pc, mem
+
+        | Free, (I32 i, _) :: vs' ->
+          let es' =
+            if not (Hashtbl.mem chk_tbl i) then (
+              [Interrupt (Bug InvalidFree) @@ e.at]
+            ) else (
+              Hashtbl.remove chk_tbl i;
+              []
+            )
+          in vs', es', logic_env, pc, mem
+
+        (* Deprecated *)
+        | SymInt32 x, vs' ->
+          let v =
+            try Logicenv.find logic_env x with
+            | Not_found ->
+              let v' = I32 (I32.rand 1000) in
+              Logicenv.add logic_env x v';
+              v'
+          in (v, Symvalue.Symbolic (SymInt32, x)) :: vs', [], logic_env, pc, mem
+
+        (* Deprecated *)
+        | SymInt64 x, vs' ->
+          let v =
+            try Logicenv.find logic_env x with
+            | Not_found ->
+              let v' = I64 (I64.rand 1000) in
+              Logicenv.add logic_env x v';
+              v'
+          in (v, Symvalue.Symbolic (SymInt64, x)) :: vs', [], logic_env, pc, mem
+
+        (* Deprecated *)
+        | SymFloat32 x, vs' ->
+          let v =
+            try Logicenv.find logic_env x with
+            | Not_found ->
+              let v' = F32 (F32.rand 1000.0) in
+              Logicenv.add logic_env x v';
+              v'
+          in (v, Symvalue.Symbolic (SymFloat32, x)) :: vs', [], logic_env, pc, mem
+
+        (* Deprecated *)
+        | SymFloat64 x, vs' ->
+          let v =
+            try Logicenv.find logic_env x with
+            | Not_found ->
+              let v' = F64 (F64.rand 1000.0) in
+              Logicenv.add logic_env x v';
+              v'
+          in (v, Symvalue.Symbolic (SymFloat64, x)) :: vs', [], logic_env, pc, mem
+
+        | GetSymInt32 x, vs' ->
+          let v =
+            try Logicenv.find logic_env x with
+            | Not_found -> Crash.error e.at "Symbolic variable was not in store."
+          in (v, Symvalue.Symbolic (SymInt32, x)) :: vs', [], logic_env, pc, mem
+
+        | GetSymInt64 x, vs' ->
+          let v =
+            try Logicenv.find logic_env x with
+            | Not_found -> Crash.error e.at "Symbolic variable was not in store."
+          in (v, Symvalue.Symbolic (SymInt64, x)) :: vs', [], logic_env, pc, mem
+
+        | GetSymFloat32 x, vs' ->
+          let v =
+            try Logicenv.find logic_env x with
+            | Not_found -> Crash.error e.at "Symbolic variable was not in store."
+          in (v, Symvalue.Symbolic (SymFloat32, x)) :: vs', [], logic_env, pc, mem
+
+        | GetSymFloat64 x, vs' ->
+          let v =
+            try Logicenv.find logic_env x with
+            | Not_found -> Crash.error e.at "Symbolic variable was not in store."
+          in (v, Symvalue.Symbolic (SymFloat64, x)) :: vs', [], logic_env, pc, mem
+
+        | TernaryOp, (I32 r2, s_r2) :: (I32 r1, s_r1) :: (I32 c, s_c) :: vs' ->
+          let r = I32 (if c = 0l then r2 else r1) in
+          let s_c' = to_constraint (simplify s_c) in
+          let v, asm =
+            begin match s_c' with
+            | None -> (r, if c = 0l then s_r2 else s_r1), pc.assumptions
+            | Some s ->
+              let x = Logicenv.next logic_env "__ternary" in
+              Logicenv.add logic_env x r;
+              let s_x = to_symbolic I32Type x in
+              let t_eq  = I32Relop (I32Eq, s_x, s_r1) in
+              let t_imp = I32Binop (I32Or, negate_relop s, t_eq) in
+              let f_eq  = I32Relop (I32Eq, s_x, s_r2) in
+              let f_imp = I32Binop (I32Or, s, f_eq) in
+              let cond  = I32Binop (I32And, t_imp, f_imp) in
+              (r, s_x), I32Relop (I32Ne, cond, Value (I32 0l)) :: pc.assumptions
+            end 
+          in v :: vs', [], logic_env, { pc with assumptions = asm }, mem
+
+        | PrintStack, vs' ->
+          debug ("STACK STATE: " ^ (string_of_sym_value vs'));
+          vs', [], logic_env, pc, mem
+
+        | PrintMemory, vs' ->
+          debug ("MEMORY STATE:\n" ^ (Symmem2.to_string mem));
+          vs', [], logic_env, pc, mem
+
+        | PrintBtree, vs' ->
+          Printf.printf "B TREE STATE: \n\n";
+          Btree.print_b_tree mem;
+          vs', [], logic_env, pc, mem
+
+        | CompareExpr, (v1, ex1) :: (v2, ex2) :: vs' ->
+          let eq = Values.value_of_bool (Eval_numeric.eval_relop (Values.I32 Ast.I32Op.Eq) (I32 (Int32.of_int 1)) (I32 (Int32.of_int 1))) in
+          let neq = Values.value_of_bool (Eval_numeric.eval_relop (Values.I32 Ast.I32Op.Eq) (I32 (Int32.of_int 1)) (I32 (Int32.of_int 0))) in
+          let res =
+            match ex1, ex2 with
+            | Symbolic (SymInt32, x), Symbolic (SymInt32, y) ->
+                if x = y then (
+                  eq, Symvalue.I32Relop (I32Eq, ex1, ex2)
+                ) else (
+                  neq, Symvalue.I32Relop (I32Ne, ex1, ex2)
+                )
+            | _, _ -> eval_relop (v1, ex1) (v2, ex2) (Values.I32 Ast.I32Op.Eq)
+          in
+          res :: vs', [], logic_env, pc, mem
+
+        | IsSymbolic, (I32 n, _) :: (I32 i, _) :: vs' ->
+          let base = I64_convert.extend_i32_u i in
+          let (_, v) = Symmem2.load_bytes mem base (Int32.to_int n) in
+          (* TODO: Better symbolic matcher (deal with extract of symbolics) *)
+          let ans =
+            begin match v with
+            | Symbolic _ -> I32 1l
+            | _ -> I32 0l
+            end
+          in
+          (*Printf.printf "%d %d\n" (Int32.to_int i) (Int64.to_int addr);*)
+          (ans, Value ans) :: vs', [], logic_env, pc, mem
+
+        | _ ->
+          Crash.error e.at
+            ("missing or ill-typed operand on stack")
+      )
+
+      | STrapping msg, vs ->
+        assert false
+
+      | Interrupt i, vs ->
+        assert false
+
+      | SReturning vs', vs ->
+        Crash.error e.at "undefined frame"
+
+      | SBreaking (k, vs'), vs ->
+        Crash.error e.at "undefined label"
+
+      | SLabel (n, es0, (vs', [])), vs ->
+        vs' @ vs, [], logic_env, pc, mem
+
+      | SLabel (n, es0, (vs', {it = Interrupt i; at} :: es')), vs ->
+        vs, [Interrupt i @@ at] @ [SLabel (n, es0, (vs', es')) @@ e.at], logic_env, pc, mem
+
+      | SLabel (n, es0, (vs', {it = STrapping msg; at} :: es')), vs ->
+        vs, [STrapping msg @@ at], logic_env, pc, mem
+
+      | SLabel (n, es0, (vs', {it = SReturning vs0; at} :: es')), vs ->
+        vs, [SReturning vs0 @@ at], logic_env, pc, mem
+
+      | SLabel (n, es0, (vs', {it = SBreaking (0l, vs0); at} :: es')), vs ->
+        take n vs0 e.at @ vs, List.map plain es0, logic_env, pc, mem
+
+      | SLabel (n, es0, (vs', {it = SBreaking (k, vs0); at} :: es')), vs ->
+        vs, [SBreaking (Int32.sub k 1l, vs0) @@ at], logic_env, pc, mem
+
+      | SLabel (n, es0, code'), vs ->
+        let c' = step {c with sym_code = code'} in
+        vs, [SLabel (n, es0, c'.sym_code) @@ e.at], c'.logic_env, c'.path_cond, c'.sym_mem
+
+      | SFrame (n, frame', (vs', [])), vs ->
+        vs' @ vs, [], logic_env, pc, mem
+
+      | SFrame (n, frame', (vs', {it = Interrupt i; at} :: es')), vs ->
+        vs, [Interrupt i @@ at] @ [SFrame (n, frame', (vs', es')) @@ e.at], logic_env, pc, mem
+
+      | SFrame (n, frame', (vs', {it = STrapping msg; at} :: es')), vs ->
+        vs, [STrapping msg @@ at], logic_env, pc, mem
+
+      | SFrame (n, frame', (vs', {it = SReturning vs0; at} :: es')), vs ->
+        take n vs0 e.at @ vs, [], logic_env, pc, mem
+
+      | SFrame (n, frame', code'), vs ->
+        let c' = step {
+          sym_frame = frame';
+          sym_code = code';
+          logic_env = c.logic_env;
+          path_cond = c.path_cond;
+          sym_mem = c.sym_mem;
+          sym_budget = c.sym_budget - 1
+        }
+        in vs, [SFrame (n, c'.sym_frame, c'.sym_code) @@ e.at], c'.logic_env, c'.path_cond, c'.sym_mem
+
+      | SInvoke func, vs when c.sym_budget = 0 ->
+        Exhaustion.error e.at "call stack exhausted"
+
+      | SInvoke func, vs ->
+        let symbolic_arg t =
+          let x = Logicenv.next logic_env "arg" in
+          let v = Logicenv.get logic_env x t false in
+          (v, to_symbolic t x)
+        in
+        let FuncType (ins, out) = Func.type_of func in
+        let n = List.length ins in
+        let vs =
+          if n > 0 && (List.length vs) = 0 then
+            List.map (fun t -> symbolic_arg t) ins
+          else vs
+        in
+        let args, vs' = take n vs e.at, drop n vs e.at in
+        (match func with
+        | Func.AstFunc (t, inst', f) ->
+          let locals' = List.map (fun v -> v, Symvalue.Value v) (List.map default_value f.it.locals) in
+          let locals'' = List.rev args @ locals' in
+          let code' = [], [SPlain (Block (out, f.it.body)) @@ f.at] in
+          let frame' = {sym_inst = !inst'; sym_locals = List.map ref locals''} in
+          vs', [SFrame (List.length out, frame', code') @@ e.at], logic_env, pc, mem
+
+        | Func.HostFunc (t, f) -> failwith "HostFunc error"
+          (*try List.rev (f (List.rev args)) @ vs', [], logic_env, pc
+          with Crash (_, msg) -> Crash.error e.at msg
+           *)
+        )
+      )
+    in 
+    { c with sym_code = vs', es' @ List.tl es; logic_env = logic_env';
+             path_cond = pc'; sym_mem = mem' }
+
+  let run
+      (conf : sym_config ref)
+      (inst : module_inst ref)
+      (test_suite : string) =
+    let module PCMap = Map.Make(String) in
+    let test_cnt = count 1
+    and ini_mem  = Symmem2.to_list !inst.sym_memory
+    and ini_glob = Global.contents !inst.globals
+    and ini_code = !conf.sym_code
+    and assume_fails = Constraints.create
+    and finish = ref false and error = ref None in
+    let rec loop c global_pc =
+      if !Flags.trace then ((* Debug *)
+        let curly = String.make 35 '~' in
+        Printf.printf "%s ITERATION NUMBER %03d %s\n\n"
+          curly (!iterations + 1) curly
+      );
+      iterations := !iterations + 1;
+      let {logic_env; path_cond = pc; _} = try eval c step with
+        | InstrLimit c'            -> finish:= true; c'
+        | AssumeFail (c', pc)      ->
+            iterations := !iterations - 1;
+            Constraints.add assume_fails !iterations pc; c'
+        | AssertFail (c', at)      -> error := Some ("Assertion Failure", at); c'
+        | BugException (c', at, b) -> error := Some (string_of_bug b, at); c'
+        | e -> raise e
+      in
+      let testcase = Logicenv.(to_json (to_list logic_env)) in
+      write_test_case test_suite testcase (Option.is_some !error) test_cnt;
+      if Option.is_some !error then (
+        incomplete := true;
+        false, get_reason (Option.get !error), testcase
+      ) else if !finish || (!iterations = 1 && pc.branches = []) then (
+        true, "{}", "[]"
+      ) else (
+        let pc' = if pc.branches <> [] then Formula.(negate (to_formula pc.branches))
+                                       else Formula.True in
+        let asm' = if pc.assumptions <> [] then Formula.to_formula pc.assumptions
+                                           else Formula.True in
+        let global_pc' = PCMap.add (Formula.to_string asm') asm' global_pc |>
+          PCMap.add (Formula.to_string pc') pc' in
+        let formulas = List.map (fun (_, f) -> f) (PCMap.bindings global_pc') in
+        if !Flags.trace then ((* Debug *)
+          let delim = String.make 6 '$' in
+          let formula = Formula.conjunct formulas in
+          Printf.printf "\n\n%s LOGICAL ENVIRONMENT BEFORE Z3 STATE %s\n%s%s\n\n"
+            delim delim (Logicenv.to_string logic_env) (String.make 48 '$');
+          Printf.printf "\n\n%s PATH CONDITIONS BEFORE Z3 %s\n%s\n%s\n"
+            delim delim (pp_string_of_pc pc.branches) (String.make 38 '$');
+          Printf.printf "\n\n%s GLOBAL PATH CONDITION %s\n%s\n%s\n\n"
+            delim delim (Formula.pp_to_string formula) (String.make 28 '$');
+        );
+        let prev_time = !solver_time in
+        match timed_check_sat formulas with
+        | None   -> true, "{}", "[]"
+        | Some m ->
+            let c' = update_config m logic_env c inst ini_mem ini_glob ini_code chk_tbl in
+            if !Flags.trace then ((* Debug *)
+              let delim = String.make 6 '$' in
+              let formula = Formula.conjunct formulas in
+              Printf.printf "SATISFIABLE\nMODEL:\n%s\n"
+                (Z3.Model.to_string m);
+              Printf.printf "\n\n%s NEW LOGICAL ENV STATE %s\n%s%s\n\n"
+                delim delim (Logicenv.to_string logic_env) (String.make 28 '$');
+              Printf.printf "\n%s ITERATION %03d STATISTICS: %s\n"
+                (String.make 23 '-') !iterations (String.make 23 '-');
+              Printf.printf "PC SIZE: %d\n" (Formula.length pc');
+              Printf.printf "GLOBAL PC SIZE: %d\n" (Formula.length formula);
+              Printf.printf "TIME TO SOLVE GLOBAL PC: %f\n"
+                (!solver_time -. prev_time);
+              Printf.printf "%s\n\n\n%s\n\n"
+                (String.make 73 '-') (String.make 92 '~');
+            );
+            loop c' global_pc'
+      )
+    in 
+    loop_start := Sys.time ();
+    let spec, reason, witness =
+      PCMap.add "True" Formula.True PCMap.empty |> loop !conf in
+    let loop_time = (Sys.time ()) -. !loop_start in
+    let n_lines = List.((length !inst.types) + (length !inst.tables) +
+                        (length !inst.memories) + (length !inst.globals) +
+                        (length !inst.exports) + 1) in
+    let coverage = (Coverage.calculate_cov inst (n_lines + !lines_to_ignore)) *. 100.0 in
+    write_report spec reason witness coverage loop_time;
+    !conf.sym_code
+
+end
+
+module GuidedSearch (X : Paths) =
+struct
+  type tree =
+    | Leaf
+    | Node of tree ref * tree ref
+
+  (* Execution tracing *)
+  let head = ref Leaf
+  let tree = ref head
+  let to_explore = X.create ()
+
+  (* Tracks malloc chunks (loc, size) *)
+  let chk_tbl = Hashtbl.create 512
+
+  let move_true (t : tree ref) : tree ref * bool =
+    match !t with
+    | Leaf ->
+      let rt = ref Leaf and rf = ref Leaf in
+      t := Node (rt, rf);
+      rt, true
+    | Node (rt, rf) -> rt, false
+
+  let move_false (t : tree ref) : tree ref * bool =
+    match !t with
+    | Leaf ->
+      let rt = ref Leaf and rf = ref Leaf in
+      t := Node (rt, rf);
+      rf, true
+    | Node (rt, rf) -> rf, false
+
+  let branch_on_cond bval c pc : unit =
+    let c' = simplify c in
+    if not (is_concrete c') then (
+      let tree', to_branch = if bval then move_true !tree
+                                     else move_false !tree in
+      tree := tree';
+      let pc' = pc.assumptions @ pc.branches in
+      if to_branch then X.push (add_constraint ~neg:bval c pc') to_explore
+    )
+
+  (*  Symbolic step  *)
+  let rec step (c : sym_config) : sym_config =
+    step_cnt := !step_cnt + 1;
+    let {
+      sym_frame = frame;
+      sym_code  = vs, es;
+      logic_env = logic_env;
+      path_cond = pc;
+      sym_mem   = mem;
+      _
+    } = c in
+    let e = List.hd es in
+    Coverage.record_line (Source.get_line e.at);
+    let vs', es', logic_env', pc', mem' =
+      if (not (!Flags.inst_limit = -1)) && (!step_cnt >= !Flags.inst_limit) then (
+        incomplete := true;
+        vs, [Interrupt IntLimit @@ e.at], logic_env, pc, mem
+      ) else (match e.it, vs with
+      | SPlain e', vs ->
+        (match e', vs with
+        | Unreachable, vs ->
+          vs, [STrapping "unreachable executed" @@ e.at], logic_env, pc, mem
+
+        | Nop, vs ->
+          vs, [], logic_env, pc, mem
+
+        | Block (ts, es'), vs ->
+          vs, [SLabel (List.length ts, [], ([], List.map plain es')) @@ e.at], logic_env, pc, mem
+
+        | Loop (ts, es'), vs ->
+          vs, [SLabel (0, [e' @@ e.at], ([], List.map plain es')) @@ e.at], logic_env, pc, mem
+
+        | If (ts, es1, es2), (I32 0l, ex) :: vs' ->
+          let _ = branch_on_cond false ex pc in
+          let pc' = { pc with branches = add_constraint ~neg:true ex pc.branches } in
+          vs', [SPlain (Block (ts, es2)) @@ e.at], logic_env, pc', mem
+
+        | If (ts, es1, es2), (I32 i, ex) :: vs' ->
+          let _ = branch_on_cond true ex pc in
+          let pc' = { pc with branches = add_constraint ex pc.branches } in
+          vs', [SPlain (Block (ts, es1)) @@ e.at], logic_env, pc', mem
+
+        | Br x, vs ->
+          [], [SBreaking (x.it, vs) @@ e.at], logic_env, pc, mem
+
+        | BrIf x, (I32 0l, ex) :: vs' ->
+          let _ = branch_on_cond false ex pc in
+          let pc' = { pc with branches = add_constraint ~neg:true ex pc.branches } in
+          vs', [], logic_env, pc', mem
+
+        | BrIf x, (I32 i, ex) :: vs' ->
+          let _ = branch_on_cond true ex pc in
+          let pc' = { pc with branches = add_constraint ex pc.branches } in
+          vs', [SPlain (Br x) @@ e.at], logic_env, pc', mem
+
+        | BrTable (xs, x), (I32 i, _) :: vs' when I32.ge_u i (Lib.List32.length xs) ->
+          vs', [SPlain (Br x) @@ e.at], logic_env, pc, mem
+
+        | BrTable (xs, x), (I32 i, _) :: vs' ->
+          vs', [SPlain (Br (Lib.List32.nth xs i)) @@ e.at], logic_env, pc, mem
+
+        | Return, vs ->
+          [], [SReturning vs @@ e.at], logic_env, pc, mem
+
+        | Call x, vs ->
+          vs, [SInvoke (func frame.sym_inst x) @@ e.at], logic_env, pc, mem
+
+        | CallIndirect x, (I32 i, _) :: vs ->
+          let func = func_elem frame.sym_inst (0l @@ e.at) i e.at in
+          if type_ frame.sym_inst x <> Func.type_of func then
+            vs, [STrapping "indirect call type mismatch" @@ e.at], logic_env, pc, mem
+          else
+            vs, [SInvoke func @@ e.at], logic_env, pc, mem
+
+        | Drop, v :: vs' ->
+          vs', [], logic_env, pc, mem
+
+        | Select, (I32 0l, ex) :: v2 :: v1 :: vs' ->
+          let _ = branch_on_cond false ex pc in
+          let pc' = { pc with branches = add_constraint ~neg:true ex pc.branches } in
+          v2 :: vs', [], logic_env, pc', mem
+
+        | Select, (I32 i, ex) :: v2 :: v1 :: vs' ->
+          let _ = branch_on_cond true ex pc in
+          let pc' = { pc with branches = add_constraint ex pc.branches } in
+          v1 :: vs', [], logic_env, pc', mem
+
+        | LocalGet x, vs ->
+          !(local frame x) :: vs, [], logic_env, pc, mem
+
+        | LocalSet x, (v, ex) :: vs' ->
+          local frame x := (v, simplify ex);
+          vs', [], logic_env, pc, mem
+
+        | LocalTee x, (v, ex) :: vs' ->
+          let ex' = simplify ex in
+          local frame x := (v, ex');
+          (v, ex') :: vs', [], logic_env, pc, mem
+
+        | GlobalGet x, vs ->
+          let v' = Global.load (global frame.sym_inst x) in
+          (v', Value v') :: vs, [], logic_env, pc, mem
+
+        | GlobalSet x, (v, _) :: vs' ->
+          (try
+            Global.store (global frame.sym_inst x) v; vs', [], logic_env, pc, mem
+          with  Global.NotMutable -> Crash.error e.at "write to immutable global"
+              | Global.Type -> Crash.error e.at "type mismatch at global write")
+
+        | Load {offset; ty; sz; _}, (I32 i, sym_ptr) :: vs' ->
+          let base = I64_convert.extend_i32_u i in
+          (* overflow check *)
+          let ptr = get_ptr (simplify sym_ptr) in
+          begin try
+            if Option.is_some ptr then begin
+              let low = I32Value.of_value (Option.get ptr) in
+              let chunk_size =
+                try Hashtbl.find chk_tbl low
+                with Not_found -> raise (BugException (c, e.at, UAF)) in
+              let high = Int64.(add (of_int32 low) (of_int32 chunk_size))
+              and ptr_val = Int64.(add base (of_int32 offset)) in
+              (* ptr_val \notin [low, high[ => overflow *)
+              if ptr_val < (Int64.of_int32 low) || ptr_val >= high then
+                raise (BugException (c, e.at, Overflow))
+            end;
+            let (v, e) =
+              match sz with
+              | None           -> Symmem2.load_value mem base offset ty
+              | Some (sz, ext) -> Symmem2.load_packed sz ext mem base offset ty
+            in 
+            (*print_endline ("after load: " ^ (Symvalue.to_string e));*)
+            (v, e) :: vs', [], logic_env, pc, mem
+          with
+          | BugException (_, at, b) ->
+            vs', [Interrupt (Bug b) @@ e.at], logic_env, pc, mem
+          | exn ->
+            vs', [STrapping (memory_error e.at exn) @@ e.at], logic_env, pc, mem
+          end
+
+        | Store {offset; sz; _}, (v, ex) :: (I32 i, sym_ptr) :: vs' ->
+          let base = I64_convert.extend_i32_u i in
+          let ptr = get_ptr (simplify sym_ptr) in
+          begin try
+            if Option.is_some ptr then begin
+              let low = I32Value.of_value (Option.get ptr) in
+              let chunk_size =
+                try Hashtbl.find chk_tbl low
+                with Not_found -> raise (BugException (c, e.at, UAF)) in
+              let high = Int64.(add (of_int32 low) (of_int32 chunk_size))
+              and ptr_val = Int64.(add base (of_int32 offset)) in
+              if (Int64.of_int32 low) > ptr_val || ptr_val >= high then
+                raise (BugException (c, e.at, Overflow))
+            end;
+            begin match sz with
+            | None    -> Symmem2.store_value mem base offset (v, simplify ex)
+            | Some sz -> Symmem2.store_packed sz mem base offset (v, simplify ex)
+            end;
+            vs', [], logic_env, pc, mem
+          with
+          | BugException (_, at, b) ->
+            vs', [Interrupt (Bug b) @@ e.at], logic_env, pc, mem
+          | exn ->
+            vs', [STrapping (memory_error e.at exn) @@ e.at], logic_env, pc, mem
+          end
+
+        | MemorySize, vs ->
+          let mem' = memory frame.sym_inst (0l @@ e.at) in
+          let v = I32 (Memory.size mem') in
+          (v, Value v) :: vs, [], logic_env, pc, mem
+
+        | MemoryGrow, (I32 delta, _) :: vs' ->
+          let mem' = memory frame.sym_inst (0l @@ e.at) in
+          let old_size = Memory.size mem' in
+          let result =
+            try Memory.grow mem' delta; old_size
+            with Memory.SizeOverflow | Memory.SizeLimit | Memory.OutOfMemory -> -1l
+          in (I32 result, Value (I32 result)) :: vs', [], logic_env, pc, mem
+
+        | Const v, vs ->
+          (v.it, Value (v.it)) :: vs, [], logic_env, pc, mem
+
+        | Test testop, v :: vs' ->
+          (try
+            let new_conf = eval_testop v testop in
+            new_conf :: vs', [], logic_env, pc, mem
+          with exn -> vs', [STrapping (numeric_error e.at exn) @@ e.at], logic_env, pc, mem)
+
+        | Compare relop, v2 :: v1 :: vs' ->
+          (try
+            let new_conf = eval_relop v1 v2 relop in
+            new_conf :: vs', [], logic_env, pc, mem
+          with exn -> vs', [STrapping (numeric_error e.at exn) @@ e.at], logic_env, pc, mem)
+
+        | Unary unop, v :: vs' ->
+          (try
+            let new_conf = eval_unop v unop in
+            new_conf :: vs', [], logic_env, pc, mem
+          with exn -> vs', [STrapping (numeric_error e.at exn) @@ e.at], logic_env, pc, mem)
+
+        | Binary binop, v2 :: v1 :: vs' ->
+          (try
+            let new_conf = eval_binop v1 v2 binop in
+            new_conf :: vs', [], logic_env, pc, mem
+          with exn -> vs', [STrapping (numeric_error e.at exn) @@ e.at], logic_env, pc, mem)
+
+        | Convert cvtop, v :: vs' ->
+          (try
+            let v' = eval_cvtop cvtop v in
+            v' :: vs', [], logic_env, pc, mem
+          with exn -> vs', [STrapping (numeric_error e.at exn) @@ e.at], logic_env, pc, mem)
+
+        | Dup, v :: vs' ->
+          v :: v :: vs', [], logic_env, pc, mem
+
+        | SymAssert, (I32 0l, ex) :: vs' -> (* 0 on top of stack *)
+          debug ">>> Assert FAILED! Stopping...";
+          vs', [Interrupt (AssFail pc.branches) @@ e.at], logic_env, pc, mem
+
+        | SymAssert, (I32 i, ex) :: vs' -> (* != 0 on top of stack *)
+          debug ">>> Assert reached. Checking satisfiability...";
+          let es' =
+            if is_concrete (simplify ex) then []
+            else (
+              let formulas = pc.assumptions @ (add_constraint ~neg:true ex pc.branches) in
+              match timed_check_sat (Formula.to_formulas formulas) with
+              | None   -> []
+              | Some m ->
+                let li32 = Logicenv.get_vars_by_type I32Type logic_env
+                and li64 = Logicenv.get_vars_by_type I64Type logic_env
+                and lf32 = Logicenv.get_vars_by_type F32Type logic_env
+                and lf64 = Logicenv.get_vars_by_type F64Type logic_env in
+                let binds = Z3Encoding2.lift_z3_model m li32 li64 lf32 lf64 in
+                Logicenv.update logic_env binds;
+                [Interrupt (AssFail pc.branches) @@ e.at]
+            )
+          in 
+          if es' = [] then debug "\n\n###### Assertion passed ######";
+          vs', es', logic_env, pc, mem
+
+        | SymAssume, (I32 0l, ex) :: vs' ->
+          debug (">>> Assumed false {line> " ^ (Source.string_of_pos e.at.left) ^
+            "}. Finishing...");
+          if (not !Flags.smt_assume) || is_concrete (simplify ex) then (
+            let _ = branch_on_cond false ex pc in
+            let pc' = { pc with branches = add_constraint ~neg:true ex pc.branches } in
+            vs', [Interrupt (AsmFail pc'.branches) @@ e.at], logic_env, pc', mem
+          ) else (
+            let pc' = pc.assumptions @ (add_constraint ex pc.branches) in
             let formulas = Formula.to_formulas pc' in
             let vs'', es', pc'' = match timed_check_sat formulas with
               | None ->
                 let _ = branch_on_cond false ex pc in
-                let pc_fls = {pc with branches = add_constraint ex pc.branches true} in
+                let pc_fls = { pc with branches = add_constraint ~neg:true ex pc.branches } in
                 vs', [Interrupt (AsmFail pc') @@ e.at], pc_fls
               | Some m ->
                 (* Record path *)
@@ -618,7 +1344,7 @@ struct
             let tree', _ = move_true !tree in
             tree := tree'
           );
-          let pc' = {pc with branches = add_constraint ex pc.branches false} in
+          let pc' = { pc with branches = add_constraint ex pc.branches } in
           vs', [], logic_env, pc', mem
 
         | Symbolic (ty, b), (I32 i, _) :: vs' ->
@@ -639,15 +1365,15 @@ struct
             vs', [STrapping (numeric_error e.at exn) @@ e.at], logic_env, pc, mem)
 
         | Alloc, (I32 a, sa) :: (I32 b, sb) :: vs' ->
-            Hashtbl.add chunk_table b a;
+            Hashtbl.add chk_tbl b a;
             (I32 b, Ptr (I32 b)) :: vs', [], logic_env, pc, mem
 
         | Free, (I32 i, _) :: vs' ->
           let es' =
-            if not (Hashtbl.mem chunk_table i) then (
+            if not (Hashtbl.mem chk_tbl i) then (
               [Interrupt (Bug InvalidFree) @@ e.at]
             ) else (
-              Hashtbl.remove chunk_table i;
+              Hashtbl.remove chk_tbl i;
               []
             )
           in vs', es', logic_env, pc, mem
@@ -812,7 +1538,7 @@ struct
         vs, [SBreaking (Int32.sub k 1l, vs0) @@ at], logic_env, pc, mem
 
       | SLabel (n, es0, code'), vs ->
-        let c' = sym_step {c with sym_code = code'} in
+        let c' = step {c with sym_code = code'} in
         vs, [SLabel (n, es0, c'.sym_code) @@ e.at], c'.logic_env, c'.path_cond, c'.sym_mem
 
       | SFrame (n, frame', (vs', [])), vs ->
@@ -828,7 +1554,7 @@ struct
         take n vs0 e.at @ vs, [], logic_env, pc, mem
 
       | SFrame (n, frame', code'), vs ->
-        let c' = sym_step {
+        let c' = step {
           sym_frame = frame';
           sym_code = code';
           logic_env = c.logic_env;
@@ -870,47 +1596,8 @@ struct
         )
       )
     in 
-    {
-      c with sym_code = vs', es' @ List.tl es;
-             logic_env = logic_env';
-             path_cond = pc';
-             sym_mem = mem'
-    }
-
-
-(*  Symbolic evaluation  *)
-  let rec sym_eval (c : sym_config) : sym_config = (* c_sym_value stack *)
-    match c.sym_code with
-    | vs, [] ->
-      c
-
-    | vs, {it = STrapping msg; at} :: _ ->
-      Trap.error at msg
-
-    | vs, {it = Interrupt i; at} :: es ->
-      let exn = match i with
-        | IntLimit   -> InstrLimit c
-        | AsmFail pc -> AssumeFail ({c with sym_code = vs, es}, pc)
-        | AssFail pc -> AssertFail (c, at)
-        | Bug b      -> BugException (c, at, b)
-      in raise exn
-
-    | vs, es ->
-      sym_eval (sym_step c)
-
-  let update_config model logic_env c inst mem glob code =
-    let li32 = Logicenv.get_vars_by_type I32Type logic_env
-    and li64 = Logicenv.get_vars_by_type I64Type logic_env
-    and lf32 = Logicenv.get_vars_by_type F32Type logic_env
-    and lf64 = Logicenv.get_vars_by_type F64Type logic_env in
-    let binds = Z3Encoding2.lift_z3_model model li32 li64 lf32 lf64 in
-    Hashtbl.reset chunk_table;
-    Logicenv.reset logic_env;
-    Logicenv.init logic_env binds;
-    Symmem2.clear c.sym_mem;
-    Symmem2.init c.sym_mem mem;
-    Instance.set_globals !inst glob;
-    {c with sym_budget=100000; sym_code=code; path_cond=path_cond [] []}
+    { c with sym_code = vs', es' @ List.tl es; logic_env = logic_env';
+             path_cond = pc'; sym_mem = mem' }
 
   let run
       (conf : sym_config ref)
@@ -921,15 +1608,9 @@ struct
     and ini_code = !conf.sym_code
     and ini_glob = Global.contents !inst.globals
     and finish = ref false and err = ref None in
-    let rec find_sat_pc pcs =
-      if P.is_empty pcs then None
-      else match timed_check_sat (Formula.to_formulas (P.pop pcs)) with
-      | None   -> find_sat_pc pcs
-      | Some m -> Some m
-    in
     let rec loop c =
       iterations := !iterations + 1; tree := head;
-      let {logic_env = lenv; _} = try sym_eval c with
+      let {logic_env = lenv; _} = try eval c step with
         | InstrLimit c'            -> finish := true; c'
         | AssumeFail (c', _)       -> iterations := !iterations - 1; c'
         | AssertFail (c', at)      -> err := Some ("Assertion Failure", at); c'
@@ -941,12 +1622,18 @@ struct
       if Option.is_some !err then (
         incomplete := true;
         false, get_reason (Option.get !err), testcase
-      ) else if !finish || P.is_empty to_explore then (
+      ) else if !finish || X.is_empty to_explore then (
         true, "{}", "[]"
       ) else (
+        let rec find_sat_pc pcs =
+          if X.is_empty pcs then None
+          else match timed_check_sat (Formula.to_formulas (X.pop pcs)) with
+          | None -> find_sat_pc pcs
+          | Some m -> Some m
+        in
         match find_sat_pc to_explore with
         | None   -> true, "{}", "[]"
-        | Some m -> loop (update_config m lenv c inst ini_mem ini_glob ini_code)
+        | Some m -> loop (update_config m lenv c inst ini_mem ini_glob ini_code chk_tbl)
       )
     in
     loop_start := Sys.time ();
@@ -958,87 +1645,636 @@ struct
     let coverage = (Coverage.calculate_cov inst (n_lines + !lines_to_ignore)) *. 100.0 in
     write_report spec reason witness coverage loop_time;
     !conf.sym_code
+end
 
-  let run_random
+module CoverageSearch =
+struct
+
+  type tree =
+    | Leaf
+    | Node of tree ref * tree ref
+
+  (* Execution tracing *)
+  let head = ref Leaf
+  let tree = ref head
+
+  (* Priority of PCs to explore *)
+  let to_explore = PQueue.create ()
+  let pc_map = Hashtbl.create 128
+
+  (* Tracks malloc chunks (loc, size) *)
+  let chk_tbl = Hashtbl.create 512
+
+  let move_true (t : tree ref) : tree ref * bool =
+    match !t with
+    | Leaf ->
+      let rt = ref Leaf and rf = ref Leaf in
+      t := Node (rt, rf);
+      rt, true
+    | Node (rt, rf) -> rt, false
+
+  let move_false (t : tree ref) : tree ref * bool =
+    match !t with
+    | Leaf ->
+      let rt = ref Leaf and rf = ref Leaf in
+      t := Node (rt, rf);
+      rf, true
+    | Node (rt, rf) -> rf, false
+
+  let branch_on_cond bval c pc priority : unit =
+    let c' = simplify c in
+    if not (is_concrete c') then (
+      let tree', to_branch = if bval then move_true !tree
+                                     else move_false !tree in
+      tree := tree';
+      let pc' = pc.assumptions @ pc.branches in
+      if to_branch then (
+        PQueue.push priority to_explore;
+        Hashtbl.add pc_map priority (add_constraint ~neg:bval c pc')
+      )
+    )
+
+  (*  Symbolic step  *)
+  let rec step (c : sym_config) : sym_config =
+    step_cnt := !step_cnt + 1;
+    let {
+      sym_frame = frame;
+      sym_code  = vs, es;
+      logic_env = logic_env;
+      path_cond = pc;
+      sym_mem   = mem;
+      _
+    } = c in
+    let e = List.hd es in
+    Coverage.record_line (Source.get_line e.at);
+    let vs', es', logic_env', pc', mem' =
+      if (not (!Flags.inst_limit = -1)) && (!step_cnt >= !Flags.inst_limit) then (
+        incomplete := true;
+        vs, [Interrupt IntLimit @@ e.at], logic_env, pc, mem
+      ) else (match e.it, vs with
+      | SPlain e', vs ->
+        (match e', vs with
+        | Unreachable, vs ->
+          vs, [STrapping "unreachable executed" @@ e.at], logic_env, pc, mem
+
+        | Nop, vs ->
+          vs, [], logic_env, pc, mem
+
+        | Block (ts, es'), vs ->
+          vs, [SLabel (List.length ts, [], ([], List.map plain es')) @@ e.at], logic_env, pc, mem
+
+        | Loop (ts, es'), vs ->
+          vs, [SLabel (0, [e' @@ e.at], ([], List.map plain es')) @@ e.at], logic_env, pc, mem
+
+        | If (ts, es1, es2), (I32 0l, ex) :: vs' ->
+          debug ("To_explore priority: " ^ string_of_int (List.length es1));
+          let _ = branch_on_cond false ex pc (List.length es1) in
+          let pc' = { pc with branches = add_constraint ~neg:true ex pc.branches } in
+          vs', [SPlain (Block (ts, es2)) @@ e.at], logic_env, pc', mem
+
+        | If (ts, es1, es2), (I32 i, ex) :: vs' ->
+          debug ("To_explore priority: " ^ string_of_int (List.length es2));
+          let _ = branch_on_cond true ex pc (List.length es2) in
+          let pc' = { pc with branches = add_constraint ex pc.branches } in
+          vs', [SPlain (Block (ts, es1)) @@ e.at], logic_env, pc', mem
+
+        | Br x, vs ->
+          [], [SBreaking (x.it, vs) @@ e.at], logic_env, pc, mem
+
+        | BrIf x, (I32 0l, ex) :: vs' ->
+          let _ = branch_on_cond false ex pc 1 in
+          let pc' = { pc with branches = add_constraint ~neg:true ex pc.branches } in
+          vs', [], logic_env, pc', mem
+
+        | BrIf x, (I32 i, ex) :: vs' ->
+          let _ = branch_on_cond true ex pc List.(length (tl es)) in
+          let pc' = { pc with branches = add_constraint ex pc.branches } in
+          vs', [SPlain (Br x) @@ e.at], logic_env, pc', mem
+
+        | BrTable (xs, x), (I32 i, _) :: vs' when I32.ge_u i (Lib.List32.length xs) ->
+          vs', [SPlain (Br x) @@ e.at], logic_env, pc, mem
+
+        | BrTable (xs, x), (I32 i, _) :: vs' ->
+          vs', [SPlain (Br (Lib.List32.nth xs i)) @@ e.at], logic_env, pc, mem
+
+        | Return, vs ->
+          [], [SReturning vs @@ e.at], logic_env, pc, mem
+
+        | Call x, vs ->
+          vs, [SInvoke (func frame.sym_inst x) @@ e.at], logic_env, pc, mem
+
+        | CallIndirect x, (I32 i, _) :: vs ->
+          let func = func_elem frame.sym_inst (0l @@ e.at) i e.at in
+          if type_ frame.sym_inst x <> Func.type_of func then
+            vs, [STrapping "indirect call type mismatch" @@ e.at], logic_env, pc, mem
+          else
+            vs, [SInvoke func @@ e.at], logic_env, pc, mem
+
+        | Drop, v :: vs' ->
+          vs', [], logic_env, pc, mem
+
+        | Select, (I32 0l, ex) :: v2 :: v1 :: vs' ->
+          let _ = branch_on_cond false ex pc 1 in
+          let pc' = { pc with branches = add_constraint ~neg:true ex pc.branches } in
+          v2 :: vs', [], logic_env, pc', mem
+
+        | Select, (I32 i, ex) :: v2 :: v1 :: vs' ->
+          let _ = branch_on_cond true ex pc 1 in
+          let pc' = { pc with branches = add_constraint ex pc.branches } in
+          v1 :: vs', [], logic_env, pc', mem
+
+        | LocalGet x, vs ->
+          !(local frame x) :: vs, [], logic_env, pc, mem
+
+        | LocalSet x, (v, ex) :: vs' ->
+          local frame x := (v, simplify ex);
+          vs', [], logic_env, pc, mem
+
+        | LocalTee x, (v, ex) :: vs' ->
+          let ex' = simplify ex in
+          local frame x := (v, ex');
+          (v, ex') :: vs', [], logic_env, pc, mem
+
+        | GlobalGet x, vs ->
+          let v' = Global.load (global frame.sym_inst x) in
+          (v', Value v') :: vs, [], logic_env, pc, mem
+
+        | GlobalSet x, (v, _) :: vs' ->
+          (try
+            Global.store (global frame.sym_inst x) v; vs', [], logic_env, pc, mem
+          with  Global.NotMutable -> Crash.error e.at "write to immutable global"
+              | Global.Type -> Crash.error e.at "type mismatch at global write")
+
+        | Load {offset; ty; sz; _}, (I32 i, sym_ptr) :: vs' ->
+          let base = I64_convert.extend_i32_u i in
+          (* overflow check *)
+          let ptr = get_ptr (simplify sym_ptr) in
+          begin try
+            if Option.is_some ptr then begin
+              let low = I32Value.of_value (Option.get ptr) in
+              let chunk_size =
+                try Hashtbl.find chk_tbl low
+                with Not_found -> raise (BugException (c, e.at, UAF)) in
+              let high = Int64.(add (of_int32 low) (of_int32 chunk_size))
+              and ptr_val = Int64.(add base (of_int32 offset)) in
+              (* ptr_val \notin [low, high[ => overflow *)
+              if ptr_val < (Int64.of_int32 low) || ptr_val >= high then
+                raise (BugException (c, e.at, Overflow))
+            end;
+            let (v, e) =
+              match sz with
+              | None           -> Symmem2.load_value mem base offset ty
+              | Some (sz, ext) -> Symmem2.load_packed sz ext mem base offset ty
+            in 
+            (*print_endline ("after load: " ^ (Symvalue.to_string e));*)
+            (v, e) :: vs', [], logic_env, pc, mem
+          with
+          | BugException (_, at, b) ->
+            vs', [Interrupt (Bug b) @@ e.at], logic_env, pc, mem
+          | exn ->
+            vs', [STrapping (memory_error e.at exn) @@ e.at], logic_env, pc, mem
+          end
+
+        | Store {offset; sz; _}, (v, ex) :: (I32 i, sym_ptr) :: vs' ->
+          let base = I64_convert.extend_i32_u i in
+          let ptr = get_ptr (simplify sym_ptr) in
+          begin try
+            if Option.is_some ptr then begin
+              let low = I32Value.of_value (Option.get ptr) in
+              let chunk_size =
+                try Hashtbl.find chk_tbl low
+                with Not_found -> raise (BugException (c, e.at, UAF)) in
+              let high = Int64.(add (of_int32 low) (of_int32 chunk_size))
+              and ptr_val = Int64.(add base (of_int32 offset)) in
+              if (Int64.of_int32 low) > ptr_val || ptr_val >= high then
+                raise (BugException (c, e.at, Overflow))
+            end;
+            begin match sz with
+            | None    -> Symmem2.store_value mem base offset (v, simplify ex)
+            | Some sz -> Symmem2.store_packed sz mem base offset (v, simplify ex)
+            end;
+            vs', [], logic_env, pc, mem
+          with
+          | BugException (_, at, b) ->
+            vs', [Interrupt (Bug b) @@ e.at], logic_env, pc, mem
+          | exn ->
+            vs', [STrapping (memory_error e.at exn) @@ e.at], logic_env, pc, mem
+          end
+
+        | MemorySize, vs ->
+          let mem' = memory frame.sym_inst (0l @@ e.at) in
+          let v = I32 (Memory.size mem') in
+          (v, Value v) :: vs, [], logic_env, pc, mem
+
+        | MemoryGrow, (I32 delta, _) :: vs' ->
+          let mem' = memory frame.sym_inst (0l @@ e.at) in
+          let old_size = Memory.size mem' in
+          let result =
+            try Memory.grow mem' delta; old_size
+            with Memory.SizeOverflow | Memory.SizeLimit | Memory.OutOfMemory -> -1l
+          in (I32 result, Value (I32 result)) :: vs', [], logic_env, pc, mem
+
+        | Const v, vs ->
+          (v.it, Value (v.it)) :: vs, [], logic_env, pc, mem
+
+        | Test testop, v :: vs' ->
+          (try
+            let new_conf = eval_testop v testop in
+            new_conf :: vs', [], logic_env, pc, mem
+          with exn -> vs', [STrapping (numeric_error e.at exn) @@ e.at], logic_env, pc, mem)
+
+        | Compare relop, v2 :: v1 :: vs' ->
+          (try
+            let new_conf = eval_relop v1 v2 relop in
+            new_conf :: vs', [], logic_env, pc, mem
+          with exn -> vs', [STrapping (numeric_error e.at exn) @@ e.at], logic_env, pc, mem)
+
+        | Unary unop, v :: vs' ->
+          (try
+            let new_conf = eval_unop v unop in
+            new_conf :: vs', [], logic_env, pc, mem
+          with exn -> vs', [STrapping (numeric_error e.at exn) @@ e.at], logic_env, pc, mem)
+
+        | Binary binop, v2 :: v1 :: vs' ->
+          (try
+            let new_conf = eval_binop v1 v2 binop in
+            new_conf :: vs', [], logic_env, pc, mem
+          with exn -> vs', [STrapping (numeric_error e.at exn) @@ e.at], logic_env, pc, mem)
+
+        | Convert cvtop, v :: vs' ->
+          (try
+            let v' = eval_cvtop cvtop v in
+            v' :: vs', [], logic_env, pc, mem
+          with exn -> vs', [STrapping (numeric_error e.at exn) @@ e.at], logic_env, pc, mem)
+
+        | Dup, v :: vs' ->
+          v :: v :: vs', [], logic_env, pc, mem
+
+        | SymAssert, (I32 0l, ex) :: vs' -> (* 0 on top of stack *)
+          debug ">>> Assert FAILED! Stopping...";
+          vs', [Interrupt (AssFail pc.branches) @@ e.at], logic_env, pc, mem
+
+        | SymAssert, (I32 i, ex) :: vs' -> (* != 0 on top of stack *)
+          debug ">>> Assert reached. Checking satisfiability...";
+          let es' =
+            if is_concrete (simplify ex) then []
+            else (
+              let formulas = pc.assumptions @ (add_constraint ~neg:true ex pc.branches) in
+              match timed_check_sat (Formula.to_formulas formulas) with
+              | None   -> []
+              | Some m ->
+                let li32 = Logicenv.get_vars_by_type I32Type logic_env
+                and li64 = Logicenv.get_vars_by_type I64Type logic_env
+                and lf32 = Logicenv.get_vars_by_type F32Type logic_env
+                and lf64 = Logicenv.get_vars_by_type F64Type logic_env in
+                let binds = Z3Encoding2.lift_z3_model m li32 li64 lf32 lf64 in
+                Logicenv.update logic_env binds;
+                [Interrupt (AssFail pc.branches) @@ e.at]
+            )
+          in 
+          if es' = [] then debug "\n\n###### Assertion passed ######";
+          vs', es', logic_env, pc, mem
+
+        | SymAssume, (I32 0l, ex) :: vs' ->
+          debug (">>> Assumed false {line> " ^ (Source.string_of_pos e.at.left) ^
+            "}. Finishing...");
+          if (not !Flags.smt_assume) || is_concrete (simplify ex) then (
+            let _ = branch_on_cond false ex pc List.(length (tl es)) in
+            let pc' = { pc with branches = add_constraint ~neg:true ex pc.branches } in
+            vs', [Interrupt (AsmFail pc'.branches) @@ e.at], logic_env, pc', mem
+          ) else (
+            let pc' = pc.assumptions @ (add_constraint ex pc.branches) in
+            let formulas = Formula.to_formulas pc' in
+            let vs'', es', pc'' = match timed_check_sat formulas with
+              | None ->
+                let _ = branch_on_cond false ex pc List.(length (tl es)) in
+                let pc_fls = { pc with branches = add_constraint ~neg:true ex pc.branches } in
+                vs', [Interrupt (AsmFail pc') @@ e.at], pc_fls
+              | Some m ->
+                (* Record path *)
+                if not (is_concrete (simplify ex)) then (
+                  let tree', _ = move_true !tree in
+                  tree := tree'
+                );
+                let li32 = Logicenv.get_vars_by_type I32Type logic_env
+                and li64 = Logicenv.get_vars_by_type I64Type logic_env
+                and lf32 = Logicenv.get_vars_by_type F32Type logic_env
+                and lf64 = Logicenv.get_vars_by_type F64Type logic_env in
+                let binds = Z3Encoding2.lift_z3_model m li32 li64 lf32 lf64 in
+                (* update logical environment *)
+                Logicenv.update logic_env binds;
+                (* update heap *)
+                Symmem2.update mem logic_env;
+                let f = (fun v -> let (_, s) = v in (Logicenv.eval logic_env s, s)) in
+                (* update locals *)
+                List.iter (fun a -> a := f !a) frame.sym_locals;
+                (* update stack *)
+                List.map f vs', [], {pc with branches = pc'}
+            in vs'', es', logic_env, pc'', mem)
+
+        | SymAssume, (I32 i, ex) :: vs' ->
+          debug ">>> Assume passed. Continuing execution...";
+          if not (is_concrete (simplify ex)) then (
+            let tree', _ = move_true !tree in
+            tree := tree'
+          );
+          let pc' = { pc with branches = add_constraint ex pc.branches } in
+          vs', [], logic_env, pc', mem
+
+        | Symbolic (ty, b), (I32 i, _) :: vs' ->
+          let base = I64_convert.extend_i32_u i in
+          let x = Logicenv.next logic_env (Symmem2.load_string mem base) in
+          let v = Logicenv.get logic_env x ty b in
+          (v, to_symbolic ty x) :: vs', [], logic_env, pc, mem
+
+        | Boolop boolop, (v2, sv2) :: (v1, sv1) :: vs' ->
+          let sv2' = mk_relop sv2 (Values.type_of v2) in
+          let v2' = Values.(value_of_bool (not (v2 = default_value (type_of v2)))) in
+          let sv1' = mk_relop sv1 (Values.type_of v1) in
+          let v1' = Values.(value_of_bool (not (v1 = default_value (type_of v1)))) in
+          (try
+            let v3, sv3 = eval_binop (v1', sv1') (v2', sv2') boolop in
+            (v3, simplify sv3) :: vs', [], logic_env, pc, mem
+          with exn ->
+            vs', [STrapping (numeric_error e.at exn) @@ e.at], logic_env, pc, mem)
+
+        | Alloc, (I32 a, sa) :: (I32 b, sb) :: vs' ->
+            Hashtbl.add chk_tbl b a;
+            (I32 b, Ptr (I32 b)) :: vs', [], logic_env, pc, mem
+
+        | Free, (I32 i, _) :: vs' ->
+          let es' =
+            if not (Hashtbl.mem chk_tbl i) then (
+              [Interrupt (Bug InvalidFree) @@ e.at]
+            ) else (
+              Hashtbl.remove chk_tbl i;
+              []
+            )
+          in vs', es', logic_env, pc, mem
+
+        (* Deprecated *)
+        | SymInt32 x, vs' ->
+          let v =
+            try Logicenv.find logic_env x with
+            | Not_found ->
+              let v' = I32 (I32.rand 1000) in
+              Logicenv.add logic_env x v';
+              v'
+          in (v, Symvalue.Symbolic (SymInt32, x)) :: vs', [], logic_env, pc, mem
+
+        (* Deprecated *)
+        | SymInt64 x, vs' ->
+          let v =
+            try Logicenv.find logic_env x with
+            | Not_found ->
+              let v' = I64 (I64.rand 1000) in
+              Logicenv.add logic_env x v';
+              v'
+          in (v, Symvalue.Symbolic (SymInt64, x)) :: vs', [], logic_env, pc, mem
+
+        (* Deprecated *)
+        | SymFloat32 x, vs' ->
+          let v =
+            try Logicenv.find logic_env x with
+            | Not_found ->
+              let v' = F32 (F32.rand 1000.0) in
+              Logicenv.add logic_env x v';
+              v'
+          in (v, Symvalue.Symbolic (SymFloat32, x)) :: vs', [], logic_env, pc, mem
+
+        (* Deprecated *)
+        | SymFloat64 x, vs' ->
+          let v =
+            try Logicenv.find logic_env x with
+            | Not_found ->
+              let v' = F64 (F64.rand 1000.0) in
+              Logicenv.add logic_env x v';
+              v'
+          in (v, Symvalue.Symbolic (SymFloat64, x)) :: vs', [], logic_env, pc, mem
+
+        | GetSymInt32 x, vs' ->
+          let v =
+            try Logicenv.find logic_env x with
+            | Not_found -> Crash.error e.at "Symbolic variable was not in store."
+          in (v, Symvalue.Symbolic (SymInt32, x)) :: vs', [], logic_env, pc, mem
+
+        | GetSymInt64 x, vs' ->
+          let v =
+            try Logicenv.find logic_env x with
+            | Not_found -> Crash.error e.at "Symbolic variable was not in store."
+          in (v, Symvalue.Symbolic (SymInt64, x)) :: vs', [], logic_env, pc, mem
+
+        | GetSymFloat32 x, vs' ->
+          let v =
+            try Logicenv.find logic_env x with
+            | Not_found -> Crash.error e.at "Symbolic variable was not in store."
+          in (v, Symvalue.Symbolic (SymFloat32, x)) :: vs', [], logic_env, pc, mem
+
+        | GetSymFloat64 x, vs' ->
+          let v =
+            try Logicenv.find logic_env x with
+            | Not_found -> Crash.error e.at "Symbolic variable was not in store."
+          in (v, Symvalue.Symbolic (SymFloat64, x)) :: vs', [], logic_env, pc, mem
+
+        | TernaryOp, (I32 r2, s_r2) :: (I32 r1, s_r1) :: (I32 c, s_c) :: vs' ->
+          let r = I32 (if c = 0l then r2 else r1) in
+          let s_c' = to_constraint (simplify s_c) in
+          let v, asm =
+            begin match s_c' with
+            | None -> (r, if c = 0l then s_r2 else s_r1), pc.assumptions
+            | Some s ->
+              let x = Logicenv.next logic_env "__ternary" in
+              Logicenv.add logic_env x r;
+              let s_x = to_symbolic I32Type x in
+              let t_eq  = I32Relop (I32Eq, s_x, s_r1) in
+              let t_imp = I32Binop (I32Or, negate_relop s, t_eq) in
+              let f_eq  = I32Relop (I32Eq, s_x, s_r2) in
+              let f_imp = I32Binop (I32Or, s, f_eq) in
+              let cond  = I32Binop (I32And, t_imp, f_imp) in
+              (r, s_x), I32Relop (I32Ne, cond, Value (I32 0l)) :: pc.assumptions
+            end 
+          in v :: vs', [], logic_env, {pc with assumptions = asm}, mem
+
+        | PrintStack, vs' ->
+          debug ("STACK STATE: " ^ (string_of_sym_value vs'));
+          vs', [], logic_env, pc, mem
+
+        | PrintMemory, vs' ->
+          debug ("MEMORY STATE:\n" ^ (Symmem2.to_string mem));
+          vs', [], logic_env, pc, mem
+
+        | PrintBtree, vs' ->
+          Printf.printf "B TREE STATE: \n\n";
+          Btree.print_b_tree mem;
+          vs', [], logic_env, pc, mem
+
+        | CompareExpr, (v1, ex1) :: (v2, ex2) :: vs' ->
+          let eq = Values.value_of_bool (Eval_numeric.eval_relop (Values.I32 Ast.I32Op.Eq) (I32 (Int32.of_int 1)) (I32 (Int32.of_int 1))) in
+          let neq = Values.value_of_bool (Eval_numeric.eval_relop (Values.I32 Ast.I32Op.Eq) (I32 (Int32.of_int 1)) (I32 (Int32.of_int 0))) in
+          let res =
+            match ex1, ex2 with
+            | Symbolic (SymInt32, x), Symbolic (SymInt32, y) ->
+                if x = y then (
+                  eq, Symvalue.I32Relop (I32Eq, ex1, ex2)
+                ) else (
+                  neq, Symvalue.I32Relop (I32Ne, ex1, ex2)
+                )
+            | _, _ -> eval_relop (v1, ex1) (v2, ex2) (Values.I32 Ast.I32Op.Eq)
+          in
+          res :: vs', [], logic_env, pc, mem
+
+        | IsSymbolic, (I32 n, _) :: (I32 i, _) :: vs' ->
+          let base = I64_convert.extend_i32_u i in
+          let (_, v) = Symmem2.load_bytes mem base (Int32.to_int n) in
+          (* TODO: Better symbolic matcher (deal with extract of symbolics) *)
+          let ans = match v with
+            | Symbolic _ -> I32 1l
+            | _ -> I32 0l
+          in
+          (*Printf.printf "%d %d\n" (Int32.to_int i) (Int64.to_int addr);*)
+          (ans, Value ans) :: vs', [], logic_env, pc, mem
+
+        | _ ->
+          Crash.error e.at
+            ("missing or ill-typed operand on stack")
+      )
+
+      | STrapping msg, vs ->
+        assert false
+
+      | Interrupt i, vs ->
+        assert false
+
+      | SReturning vs', vs ->
+        Crash.error e.at "undefined frame"
+
+      | SBreaking (k, vs'), vs ->
+        Crash.error e.at "undefined label"
+
+      | SLabel (n, es0, (vs', [])), vs ->
+        vs' @ vs, [], logic_env, pc, mem
+
+      | SLabel (n, es0, (vs', {it = Interrupt i; at} :: es')), vs ->
+        vs, [Interrupt i @@ at] @ [SLabel (n, es0, (vs', es')) @@ e.at], logic_env, pc, mem
+
+      | SLabel (n, es0, (vs', {it = STrapping msg; at} :: es')), vs ->
+        vs, [STrapping msg @@ at], logic_env, pc, mem
+
+      | SLabel (n, es0, (vs', {it = SReturning vs0; at} :: es')), vs ->
+        vs, [SReturning vs0 @@ at], logic_env, pc, mem
+
+      | SLabel (n, es0, (vs', {it = SBreaking (0l, vs0); at} :: es')), vs ->
+        take n vs0 e.at @ vs, List.map plain es0, logic_env, pc, mem
+
+      | SLabel (n, es0, (vs', {it = SBreaking (k, vs0); at} :: es')), vs ->
+        vs, [SBreaking (Int32.sub k 1l, vs0) @@ at], logic_env, pc, mem
+
+      | SLabel (n, es0, code'), vs ->
+        let c' = step {c with sym_code = code'} in
+        vs, [SLabel (n, es0, c'.sym_code) @@ e.at], c'.logic_env, c'.path_cond, c'.sym_mem
+
+      | SFrame (n, frame', (vs', [])), vs ->
+        vs' @ vs, [], logic_env, pc, mem
+
+      | SFrame (n, frame', (vs', {it = Interrupt i; at} :: es')), vs ->
+        vs, [Interrupt i @@ at] @ [SFrame (n, frame', (vs', es')) @@ e.at], logic_env, pc, mem
+
+      | SFrame (n, frame', (vs', {it = STrapping msg; at} :: es')), vs ->
+        vs, [STrapping msg @@ at], logic_env, pc, mem
+
+      | SFrame (n, frame', (vs', {it = SReturning vs0; at} :: es')), vs ->
+        take n vs0 e.at @ vs, [], logic_env, pc, mem
+
+      | SFrame (n, frame', code'), vs ->
+        let c' = step {
+          sym_frame = frame';
+          sym_code = code';
+          logic_env = c.logic_env;
+          path_cond = c.path_cond;
+          sym_mem = c.sym_mem;
+          sym_budget = c.sym_budget - 1
+        }
+        in vs, [SFrame (n, c'.sym_frame, c'.sym_code) @@ e.at], c'.logic_env, c'.path_cond, c'.sym_mem
+
+      | SInvoke func, vs when c.sym_budget = 0 ->
+        Exhaustion.error e.at "call stack exhausted"
+
+      | SInvoke func, vs ->
+        let symbolic_arg t =
+          let x = Logicenv.next logic_env "arg" in
+          let v = Logicenv.get logic_env x t false in
+          (v, to_symbolic t x)
+        in
+        let FuncType (ins, out) = Func.type_of func in
+        let n = List.length ins in
+        let vs =
+          if n > 0 && (List.length vs) = 0 then
+            List.map (fun t -> symbolic_arg t) ins
+          else vs
+        in
+        let args, vs' = take n vs e.at, drop n vs e.at in
+        (match func with
+        | Func.AstFunc (t, inst', f) ->
+          let locals' = List.map (fun v -> v, Symvalue.Value v) (List.map default_value f.it.locals) in
+          let locals'' = List.rev args @ locals' in
+          let code' = [], [SPlain (Block (out, f.it.body)) @@ f.at] in
+          let frame' = {sym_inst = !inst'; sym_locals = List.map ref locals''} in
+          vs', [SFrame (List.length out, frame', code') @@ e.at], logic_env, pc, mem
+
+        | Func.HostFunc (t, f) -> failwith "HostFunc error"
+          (*try List.rev (f (List.rev args)) @ vs', [], logic_env, pc
+          with Crash (_, msg) -> Crash.error e.at msg
+           *)
+        )
+      )
+    in 
+    { c with sym_code = vs', es' @ List.tl es; logic_env = logic_env';
+             path_cond = pc'; sym_mem = mem' }
+
+  let run
       (conf : sym_config ref)
       (inst : module_inst ref)
       (test_suite : string) =
-    rand := true;
-    let module PCMap = Map.Make(String) in
-    let test_cnt = count 1
-    and ini_mem  = Symmem2.to_list !inst.sym_memory
-    and ini_glob = Global.contents !inst.globals
+    let test_cntr = count 1
+    and ini_mem = Symmem2.to_list !inst.sym_memory
     and ini_code = !conf.sym_code
-    and assume_fails = Constraints.create
-    and finish = ref false and error = ref None in
-    let rec loop c global_pc =
-      if !Flags.trace then ((* Debug *)
-        let curly = String.make 35 '~' in
-        Printf.printf "%s ITERATION NUMBER %03d %s\n\n"
-          curly (!iterations + 1) curly
-      );
-      iterations := !iterations + 1;
-      let {logic_env; path_cond = pc; _} = try sym_eval c with
-        | InstrLimit c'            -> finish:= true; c'
-        | AssumeFail (c', pc)      ->
-            iterations := !iterations - 1;
-            Constraints.add assume_fails !iterations pc; c'
-        | AssertFail (c', at)      -> error := Some ("Assertion Failure", at); c'
-        | BugException (c', at, b) -> error := Some (string_of_bug b, at); c'
+    and ini_glob = Global.contents !inst.globals
+    and finish = ref false and err = ref None in
+    let rec loop c =
+      iterations := !iterations + 1; tree := head;
+      let {logic_env = lenv; _} = try eval c step with
+        | InstrLimit c'            -> finish := true; c'
+        | AssumeFail (c', _)       -> iterations := !iterations - 1; c'
+        | AssertFail (c', at)      -> err := Some ("Assertion Failure", at); c'
+        | BugException (c', at, b) -> err := Some (string_of_bug b, at); c'
         | e -> raise e
       in
-      let testcase = Logicenv.(to_json (to_list logic_env)) in
-      write_test_case test_suite testcase (Option.is_some !error) test_cnt;
-      if Option.is_some !error then (
+      let testcase = Logicenv.(to_json (to_list lenv)) in
+      write_test_case test_suite testcase (Option.is_some !err) test_cntr;
+      if Option.is_some !err then (
         incomplete := true;
-        false, get_reason (Option.get !error), testcase
-      ) else if !finish || (!iterations = 1 && pc.branches = []) then (
+        false, get_reason (Option.get !err), testcase
+      ) else if !finish || PQueue.is_empty to_explore then (
         true, "{}", "[]"
       ) else (
-        let pc' = if pc.branches <> [] then Formula.(negate (to_formula pc.branches))
-                                       else Formula.True in
-        let asm' = if pc.assumptions <> [] then Formula.to_formula pc.assumptions
-                                           else Formula.True in
-        let global_pc' = PCMap.add (Formula.to_string asm') asm' global_pc |>
-          PCMap.add (Formula.to_string pc') pc' in
-        let formulas = List.map (fun (_, f) -> f) (PCMap.bindings global_pc') in
-        if !Flags.trace then ((* Debug *)
-          let delim = String.make 6 '$' in
-          let formula = Formula.conjunct formulas in
-          Printf.printf "\n\n%s LOGICAL ENVIRONMENT BEFORE Z3 STATE %s\n%s%s\n\n"
-            delim delim (Logicenv.to_string logic_env) (String.make 48 '$');
-          Printf.printf "\n\n%s PATH CONDITIONS BEFORE Z3 %s\n%s\n%s\n"
-            delim delim (pp_string_of_pc pc.branches) (String.make 38 '$');
-          Printf.printf "\n\n%s GLOBAL PATH CONDITION %s\n%s\n%s\n\n"
-            delim delim (Formula.pp_to_string formula) (String.make 28 '$');
-        );
-        let prev_time = !solver_time in
-        match timed_check_sat formulas with
+        let rec find_sat_pc pcs =
+          if PQueue.is_empty pcs then None
+          else (
+            let priority = PQueue.pop pcs in
+            let pc = Hashtbl.find pc_map priority in
+            Hashtbl.remove pc_map priority;
+            match timed_check_sat (Formula.to_formulas pc) with
+            | None -> find_sat_pc pcs
+            | Some m -> Some m
+          )
+        in
+        match find_sat_pc to_explore with
         | None   -> true, "{}", "[]"
-        | Some m ->
-            let c' = update_config m logic_env c inst ini_mem ini_glob ini_code in
-            if !Flags.trace then ((* Debug *)
-              let delim = String.make 6 '$' in
-              let formula = Formula.conjunct formulas in
-              Printf.printf "SATISFIABLE\nMODEL:\n%s\n"
-                (Z3.Model.to_string m);
-              Printf.printf "\n\n%s NEW LOGICAL ENV STATE %s\n%s%s\n\n"
-                delim delim (Logicenv.to_string logic_env) (String.make 28 '$');
-              Printf.printf "\n%s ITERATION %03d STATISTICS: %s\n"
-                (String.make 23 '-') !iterations (String.make 23 '-');
-              Printf.printf "PC SIZE: %d\n" (Formula.length pc');
-              Printf.printf "GLOBAL PC SIZE: %d\n" (Formula.length formula);
-              Printf.printf "TIME TO SOLVE GLOBAL PC: %f\n"
-                (!solver_time -. prev_time);
-              Printf.printf "%s\n\n\n%s\n\n"
-                (String.make 73 '-') (String.make 92 '~');
-            );
-            loop c' global_pc'
+        | Some m -> loop (update_config m lenv c inst ini_mem ini_glob ini_code chk_tbl)
       )
-    in 
+    in
     loop_start := Sys.time ();
-    let spec, reason, witness =
-      PCMap.add "True" Formula.True PCMap.empty |> loop !conf in
+    let spec, reason, witness = loop !conf in
     let loop_time = (Sys.time ()) -. !loop_start in
     let n_lines = List.((length !inst.types) + (length !inst.tables) +
                         (length !inst.memories) + (length !inst.globals) +
@@ -1048,90 +2284,10 @@ struct
     !conf.sym_code
 end
 
-module PQueue =
-struct
-  type 'a order = 'a -> 'a -> int
-
-  type 'a t = {
-    mutable     size : int;
-    mutable capacity : int;
-    mutable     heap : 'a array;
-               order : 'a order;
-  }
-
-  exception Empty
-
-
-  let make order =
-    { size = 0; capacity = 8; heap = Array.make 8 (Obj.magic 0); order = order }
-
-  let create () = 
-    { size = 0; capacity = 8; heap = Array.make 8 (Obj.magic 0); order = compare }
-
-  let length h = h.size
-
-  let is_empty h = h.size = 0
-
-  let expand_capacity h =
-    let capacity' = min (h.capacity * 2) Sys.max_array_length in
-    if h.size = capacity' then failwith "maximum capacity reached";
-    let heap' = Array.make capacity' (Obj.magic 0) in
-    Array.blit h.heap 0 heap' 0 h.size;
-    h.heap <- heap';
-    h.capacity <- capacity'
-
-  let parent i = (i - 1) / 2
-  let left   i = 2 * i + 1
-  let right  i = 2 * i + 2
-
-  let push x h =
-    let i = length h in
-    if i = h.capacity then expand_capacity h;
-    h.heap.(i)  <- x;
-    h.size <- i + 1;
-    let rec moveup i =
-      let ord = h.order in
-      let pi = parent i in
-      if i <> 0 && ord h.heap.(pi) x < 0 then (
-        let tmp = h.heap.(i) in
-        h.heap.(i) <- h.heap.(pi);
-        h.heap.(pi) <- tmp;
-        moveup pi
-      )
-    in moveup i
-
-  let top h =
-    if length h = 0 then raise Empty;
-    h.heap.(0)
-
-  let pop h =
-    let n = length h in
-    if n = 0 then raise Empty;
-    let m = h.heap.(0) in
-    h.heap.(0) <- h.heap.(n - 1);
-    h.heap.(n - 1) <- m;
-    h.size <- n - 1;
-    let rec heapify i =
-      let ord = h.order in
-      let li = left i in
-      let ri = right i in
-      if h.size > 1 && li < h.size && ri < h.size then (
-        let i' = if ord h.heap.(ri) h.heap.(li) > 0 then ri else li
-        in
-        if ord h.heap.(i') h.heap.(i) > 0 then (
-          let tmp = h.heap.(i) in
-          h.heap.(i) <- h.heap.(i');
-          h.heap.(i') <- tmp;
-          heapify i'
-        )
-      )
-    in heapify 0;
-    m
-end
-
-module DepthFirstSearch   = Search(Stack)
-module BreadthFirstSearch = Search(Queue)
-module PrioritySearch     = Search(PQueue)
+module Rnd = RandomSearch
+module Cov = CoverageSearch
+module DFS = GuidedSearch(Stack)
+module BFS = GuidedSearch(Queue)
 
 let sym_invoke' (func : func_inst) (vs : sym_value list) : sym_value list =
   (* Prepare workspace *)
@@ -1149,10 +2305,10 @@ let sym_invoke' (func : func_inst) (vs : sym_value list) : sym_value list =
   let p = parse_policy !Flags.policy in
   let f = match p with
     | None -> Crash.error at "wrong search policy provided."
-    | Some Random  -> DepthFirstSearch.run_random
-    | Some Depth   -> DepthFirstSearch.run
-    | Some Breadth -> BreadthFirstSearch.run
-    | Some Coverage -> PrioritySearch.run
+    | Some Random   -> Rnd.run
+    | Some Depth    -> DFS.run
+    | Some Breadth  -> BFS.run
+    | Some Coverage -> Cov.run
   in
   let (vs, _) = f c inst test_suite in
   try List.rev vs with Stack_overflow ->
@@ -1161,7 +2317,7 @@ let sym_invoke' (func : func_inst) (vs : sym_value list) : sym_value list =
 let eval_const (inst : module_inst) (const : const) : value =
   let sym_mem = inst.sym_memory in
   let c = sym_config inst [] (List.map plain const.it) sym_mem in
-  let res = DepthFirstSearch.sym_eval c in
+  let res = eval c Rnd.step in
   let (vs, _) = res.sym_code in
   match vs with
   | [(v, _)] -> v

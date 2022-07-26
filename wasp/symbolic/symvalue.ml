@@ -827,24 +827,10 @@ let mk_relop (e : sym_expr) (t : value_type) : sym_expr =
   )
 
 let add_constraint
+    ?(neg : bool = false)
     (e : sym_expr) 
-    (pc : path_conditions) 
-    (neg : bool) : path_conditions =
-  let cond = 
+    (pc : path_conditions) : path_conditions =
+  let cond =
     let c = to_constraint (simplify e) in
     if neg then Option.map negate_relop c else c
-  in
-  (*
-  let asgn = match cond with
-    | Some (I32Relop (Si32.I32Eq, Symbolic (t, x), Value v))
-    | Some (I64Relop (Si64.I64Eq, Symbolic (t, x), Value v))
-    | Some (F32Relop (Sf32.F32Eq, Symbolic (t, x), Value v))
-    | Some (F64Relop (Sf64.F64Eq, Symbolic (t, x), Value v)) -> 
-        Some ((t, x), v)
-    | _ -> None
-  in 
-  let opt_rewrite e = Option.map_default (fun a -> rewrite e a) e asgn in
-  let pc = List.map (fun e -> simplify e) (List.map (fun e -> opt_rewrite e) pc) in
-  let pc = List.filter (fun a -> is_relop a) pc in
-  *)
-  Option.map_default (fun a -> a :: pc) pc cond
+  in Option.map_default (fun a -> a :: pc) pc cond
