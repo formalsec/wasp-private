@@ -836,6 +836,12 @@ struct
           (*Printf.printf "%d %d\n" (Int32.to_int i) (Int64.to_int addr);*)
           (ans, Value ans) :: vs', [], logic_env, pc, mem
 
+        | SetPriority, _ :: _  :: _ :: vs' ->
+          vs', [], logic_env, pc, mem
+
+        | PopPriority, _ :: vs' ->
+          vs', [], logic_env, pc, mem
+
         | _ ->
           Crash.error e.at
             ("missing or ill-typed operand on stack")
@@ -1502,6 +1508,12 @@ struct
           (*Printf.printf "%d %d\n" (Int32.to_int i) (Int64.to_int addr);*)
           (ans, Value ans) :: vs', [], logic_env, pc, mem
 
+        | SetPriority, _ :: _  :: _ :: vs' ->
+          vs', [], logic_env, pc, mem
+
+        | PopPriority, _ :: vs' ->
+          vs', [], logic_env, pc, mem
+
         | _ ->
           Crash.error e.at
             ("missing or ill-typed operand on stack")
@@ -1661,6 +1673,7 @@ struct
   (* Priority of PCs to explore *)
   let to_explore = PQueue.create ()
   let pc_map = Hashtbl.create 128
+  let p_stack = Stack.create ()
 
   (* Tracks malloc chunks (loc, size) *)
   let chk_tbl = Hashtbl.create 512
@@ -1727,14 +1740,14 @@ struct
           vs, [SLabel (0, [e' @@ e.at], ([], List.map plain es')) @@ e.at], logic_env, pc, mem
 
         | If (ts, es1, es2), (I32 0l, ex) :: vs' ->
-          debug ("To_explore priority: " ^ string_of_int (List.length es1));
-          let _ = branch_on_cond false ex pc (List.length es1) in
+          let _, (p, _) = Stack.top p_stack in
+          let _ = branch_on_cond false ex pc p in
           let pc' = { pc with branches = add_constraint ~neg:true ex pc.branches } in
           vs', [SPlain (Block (ts, es2)) @@ e.at], logic_env, pc', mem
 
         | If (ts, es1, es2), (I32 i, ex) :: vs' ->
-          debug ("To_explore priority: " ^ string_of_int (List.length es2));
-          let _ = branch_on_cond true ex pc (List.length es2) in
+          let _, (_, p) = Stack.top p_stack in
+          let _ = branch_on_cond true ex pc p in
           let pc' = { pc with branches = add_constraint ex pc.branches } in
           vs', [SPlain (Block (ts, es1)) @@ e.at], logic_env, pc', mem
 
@@ -1742,12 +1755,14 @@ struct
           [], [SBreaking (x.it, vs) @@ e.at], logic_env, pc, mem
 
         | BrIf x, (I32 0l, ex) :: vs' ->
-          let _ = branch_on_cond false ex pc 1 in
+          let _, (p, _) = try Stack.top p_stack with Stack.Empty -> (0, (1, 1)) in
+          let _ = branch_on_cond false ex pc p in
           let pc' = { pc with branches = add_constraint ~neg:true ex pc.branches } in
           vs', [], logic_env, pc', mem
 
         | BrIf x, (I32 i, ex) :: vs' ->
-          let _ = branch_on_cond true ex pc List.(length (tl es)) in
+          let _, (_, p) = try Stack.top p_stack with Stack.Empty -> (0, (1, 1)) in
+          let _ = branch_on_cond true ex pc p in
           let pc' = { pc with branches = add_constraint ex pc.branches } in
           vs', [SPlain (Br x) @@ e.at], logic_env, pc', mem
 
@@ -1939,7 +1954,7 @@ struct
           debug (">>> Assumed false {line> " ^ (Source.string_of_pos e.at.left) ^
             "}. Finishing...");
           if (not !Flags.smt_assume) || is_concrete (simplify ex) then (
-            let _ = branch_on_cond false ex pc List.(length (tl es)) in
+            let _ = branch_on_cond false ex pc max_int in
             let pc' = { pc with branches = add_constraint ~neg:true ex pc.branches } in
             vs', [Interrupt (AsmFail pc'.branches) @@ e.at], logic_env, pc', mem
           ) else (
@@ -1947,7 +1962,7 @@ struct
             let formulas = Formula.to_formulas pc' in
             let vs'', es', pc'' = match timed_check_sat formulas with
               | None ->
-                let _ = branch_on_cond false ex pc List.(length (tl es)) in
+                let _ = branch_on_cond false ex pc max_int in
                 let pc_fls = { pc with branches = add_constraint ~neg:true ex pc.branches } in
                 vs', [Interrupt (AsmFail pc') @@ e.at], pc_fls
               | Some m ->
@@ -2109,19 +2124,16 @@ struct
           vs', [], logic_env, pc, mem
 
         | CompareExpr, (v1, ex1) :: (v2, ex2) :: vs' ->
-          let eq = Values.value_of_bool (Eval_numeric.eval_relop (Values.I32 Ast.I32Op.Eq) (I32 (Int32.of_int 1)) (I32 (Int32.of_int 1))) in
-          let neq = Values.value_of_bool (Eval_numeric.eval_relop (Values.I32 Ast.I32Op.Eq) (I32 (Int32.of_int 1)) (I32 (Int32.of_int 0))) in
-          let res =
+          let eq = I32 1l and ne = I32 0l in
+          let v =
             match ex1, ex2 with
             | Symbolic (SymInt32, x), Symbolic (SymInt32, y) ->
-                if x = y then (
-                  eq, Symvalue.I32Relop (I32Eq, ex1, ex2)
-                ) else (
-                  neq, Symvalue.I32Relop (I32Ne, ex1, ex2)
-                )
-            | _, _ -> eval_relop (v1, ex1) (v2, ex2) (Values.I32 Ast.I32Op.Eq)
+              let c = if x = y then eq else ne in
+              c, Symvalue.I32Relop (I32Eq, ex1, ex2)
+            | _, _ -> 
+              eval_relop (v1, ex1) (v2, ex2) (Values.I32 Ast.I32Op.Eq)
           in
-          res :: vs', [], logic_env, pc, mem
+          v :: vs', [], logic_env, pc, mem
 
         | IsSymbolic, (I32 n, _) :: (I32 i, _) :: vs' ->
           let base = I64_convert.extend_i32_u i in
@@ -2133,6 +2145,17 @@ struct
           in
           (*Printf.printf "%d %d\n" (Int32.to_int i) (Int64.to_int addr);*)
           (ans, Value ans) :: vs', [], logic_env, pc, mem
+
+        | SetPriority, (I32 f, _) :: (I32 t, _)  :: (I32 id, _) :: vs' ->
+          let id', t', f' = Int32.to_int id, Int32.to_int t, Int32.to_int f in
+          let _ = Stack.push (id', (t', f')) p_stack in
+          vs', [], logic_env, pc, mem
+
+        | PopPriority, (I32 id, _) :: vs' ->
+          let id', _ = Stack.pop p_stack in
+          if (Int32.to_int id) <> id' then
+            print_endline ("found misaligned priority block");
+          vs', [], logic_env, pc, mem
 
         | _ ->
           Crash.error e.at
