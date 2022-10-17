@@ -40,7 +40,7 @@ let numeric_error at = function
   | exn -> raise exn
 
 
-type policy = Random | Depth | Breadth | Coverage
+type policy = Random | Depth | Breadth (*| Coverage *)
 
 type bug =
   | Overflow
@@ -145,7 +145,7 @@ let parse_policy (p : string) : policy option =
   | "random"   -> Some Random
   | "depth"    -> Some Depth
   | "breadth"  -> Some Breadth
-  | "coverage" -> Some Coverage
+  (*| "coverage" -> Some Coverage *)
   | _          -> None
 
 let string_of_bug : (bug -> string) = function
@@ -1659,6 +1659,7 @@ struct
     !conf.sym_code
 end
 
+(*
 module CoverageSearch =
 struct
 
@@ -2306,9 +2307,10 @@ struct
     write_report spec reason witness coverage loop_time;
     !conf.sym_code
 end
+*)
 
 module Rnd = RandomSearch
-module Cov = CoverageSearch
+(* module Cov = CoverageSearch *)
 module DFS = GuidedSearch(Stack)
 module BFS = GuidedSearch(Queue)
 
@@ -2331,7 +2333,7 @@ let sym_invoke' (func : func_inst) (vs : sym_value list) : sym_value list =
     | Some Random   -> Rnd.run
     | Some Depth    -> DFS.run
     | Some Breadth  -> BFS.run
-    | Some Coverage -> Cov.run
+    (* | Some Coverage -> Cov.run *)
   in
   let (vs, _) = f c inst test_suite in
   try List.rev vs with Stack_overflow ->
