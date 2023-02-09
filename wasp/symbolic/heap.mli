@@ -18,7 +18,7 @@ val clear : memory -> unit
 val memcpy : memory -> memory
 val add_seq : memory -> (address * store) Seq.t -> unit
 val to_seq : memory -> (address * store) Seq.t
-val update : memory -> Logicenv.t -> unit
+val update : memory -> Store.t -> unit
 val to_list : memory -> (address * store) list
 val to_string : memory -> string
 val load_byte : memory -> address -> store

@@ -17,9 +17,9 @@ exception Crash = Crash.Error
 exception Exhaustion = Exhaustion.Error
 
 let memory_error at = function
-  | Symmem2.InvalidAddress a ->
+  | Heap.InvalidAddress a ->
       Int64.to_string a ^ ":address not found in hashtable"
-  | Symmem2.Bounds -> "out of bounds memory access"
+  | Heap.Bounds -> "out of bounds memory access"
   | Memory.SizeOverflow -> "memory size overflow"
   | Memory.SizeLimit -> "memory size limit reached"
   | Memory.Type -> Crash.error at "type mismatch at memory access"
@@ -68,8 +68,8 @@ type config = {
   frame : frame;
   glob : Globals.t;
   code : code;
-  mem : Symmem2.t;
-  store : Logicenv.t;
+  mem : Heap.t;
+  store : Store.t;
   heap : (int32, int32) Hashtbl.t;
   pc : pc;
   bp : sym_expr list list;
@@ -85,7 +85,7 @@ let config inst vs es mem glob tree =
     glob;
     code = (vs, es);
     mem;
-    store = Logicenv.create [];
+    store = Store.create [];
     heap = Hashtbl.create 128;
     pc = [];
     bp = [];
@@ -195,7 +195,7 @@ let instr_str e =
 
 let timed_check_sat formulas =
   let start = Sys.time () in
-  let opt_model = Z3Encoding2.check_sat_core formulas in
+  let opt_model = Encoding.check formulas in
   let delta = Sys.time () -. start in
   solver_time := !solver_time +. delta;
   solver_cnt := !solver_cnt + 1;
@@ -310,9 +310,8 @@ let rec step (c : config) : config =
                  raise (BugException (c, e.at, Overflow)));
               let v, e =
                 match sz with
-                | None -> Symmem2.load_value mem base offset ty
-                | Some (sz, ext) ->
-                    Symmem2.load_packed sz ext mem base offset ty
+                | None -> Heap.load_value mem base offset ty
+                | Some (sz, ext) -> Heap.load_packed sz ext mem base offset ty
               in
               ((v, e) :: vs', [], pc, bp)
             with
@@ -335,9 +334,8 @@ let rec step (c : config) : config =
                if Int64.of_int32 low > ptr_val || ptr_val >= high then
                  raise (BugException (c, e.at, Overflow)));
               (match sz with
-              | None -> Symmem2.store_value mem base offset (v, simplify ex)
-              | Some sz ->
-                  Symmem2.store_packed sz mem base offset (v, simplify ex));
+              | None -> Heap.store_value mem base offset (v, simplify ex)
+              | Some sz -> Heap.store_packed sz mem base offset (v, simplify ex));
               (vs', [], pc, bp)
             with
             | BugException (_, at, b) ->
@@ -392,12 +390,8 @@ let rec step (c : config) : config =
             match timed_check_sat (Formula.to_formulas formulas) with
             | None -> (vs', [], pc, bp)
             | Some m ->
-                let li32 = Logicenv.get_vars_by_type I32Type store
-                and li64 = Logicenv.get_vars_by_type I64Type store
-                and lf32 = Logicenv.get_vars_by_type F32Type store
-                and lf64 = Logicenv.get_vars_by_type F64Type store in
-                let binds = Z3Encoding2.lift_z3_model m li32 li64 lf32 lf64 in
-                Logicenv.update store binds;
+                let binds = Encoding.lift m (Store.get_key_types store) in
+                Store.update store binds;
                 (vs', [ Interrupt (AssFail pc) @@ e.at ], pc, bp))
         | SymAssume, (I32 0l, ex) :: vs' when is_concrete (simplify ex) ->
             (vs', [ Interrupt (AsmFail pc) @@ e.at ], pc, bp)
@@ -420,14 +414,10 @@ let rec step (c : config) : config =
             | Some m ->
                 let tree', _ = Execution_tree.move_true !tree in
                 tree := tree';
-                let li32 = Logicenv.get_vars_by_type I32Type store
-                and li64 = Logicenv.get_vars_by_type I64Type store
-                and lf32 = Logicenv.get_vars_by_type F32Type store
-                and lf64 = Logicenv.get_vars_by_type F64Type store in
-                let binds = Z3Encoding2.lift_z3_model m li32 li64 lf32 lf64 in
-                Logicenv.update store binds;
-                Symmem2.update mem store;
-                let f (_, s) = (Logicenv.eval store s, s) in
+                let binds = Encoding.lift m (Store.get_key_types store) in
+                Store.update store binds;
+                Heap.update mem store;
+                let f (_, s) = (Store.eval store s, s) in
                 List.iter (fun a -> a := f !a) frame.locals;
                 (List.map f vs', [], pc', bp))
         | SymAssume, (I32 i, ex) :: vs' when is_concrete (simplify ex) ->
@@ -439,8 +429,8 @@ let rec step (c : config) : config =
             (vs', [], add_constraint ex pc, bp)
         | Symbolic (ty, b), (I32 i, _) :: vs' ->
             let base = I64_convert.extend_i32_u i in
-            let x = Logicenv.next store (Symmem2.load_string mem base) in
-            let v = Logicenv.get store x ty b in
+            let x = Store.next store (Heap.load_string mem base) in
+            let v = Store.get store x ty b in
             ((v, to_symbolic ty x) :: vs', [], pc, bp)
         | Boolop boolop, (v2, sv2) :: (v1, sv1) :: vs' -> (
             let sv2' = mk_relop sv2 (Values.type_of v2) in
@@ -475,28 +465,28 @@ let rec step (c : config) : config =
         | SymFloat64 x, vs' -> Crash.error e.at "SymFloat64: deprecated!"
         | GetSymInt32 x, vs' ->
             let v =
-              try Logicenv.find store x
+              try Store.find store x
               with Not_found ->
                 Crash.error e.at "Symbolic variable was not in store."
             in
             ((v, Symvalue.Symbolic (SymInt32, x)) :: vs', [], pc, bp)
         | GetSymInt64 x, vs' ->
             let v =
-              try Logicenv.find store x
+              try Store.find store x
               with Not_found ->
                 Crash.error e.at "Symbolic variable was not in store."
             in
             ((v, Symvalue.Symbolic (SymInt64, x)) :: vs', [], pc, bp)
         | GetSymFloat32 x, vs' ->
             let v =
-              try Logicenv.find store x
+              try Store.find store x
               with Not_found ->
                 Crash.error e.at "Symbolic variable was not in store."
             in
             ((v, Symvalue.Symbolic (SymFloat32, x)) :: vs', [], pc, bp)
         | GetSymFloat64 x, vs' ->
             let v =
-              try Logicenv.find store x
+              try Store.find store x
               with Not_found ->
                 Crash.error e.at "Symbolic variable was not in store."
             in
@@ -508,8 +498,8 @@ let rec step (c : config) : config =
               match s_c' with
               | None -> ((r, if c = 0l then s_r2 else s_r1), pc)
               | Some s ->
-                  let x = Logicenv.next store "__ternary" in
-                  Logicenv.add store x r;
+                  let x = Store.next store "__ternary" in
+                  Store.add store x r;
                   let s_x = to_symbolic I32Type x in
                   let t_eq = I32Relop (I32Eq, s_x, s_r1) in
                   let t_imp = I32Binop (I32Or, negate_relop s, t_eq) in
@@ -523,7 +513,7 @@ let rec step (c : config) : config =
             debug ("Stack dump: " ^ string_of_sym_value vs');
             (vs', [], pc, bp)
         | PrintMemory, vs' ->
-            debug ("Memory dump:\n" ^ Symmem2.to_string mem);
+            debug ("Memory dump:\n" ^ Heap.to_string mem);
             (vs', [], pc, bp)
         | PrintBtree, vs' ->
             Printf.printf "B TREE STATE: \n\n";
@@ -540,7 +530,7 @@ let rec step (c : config) : config =
             (res :: vs', [], pc, bp)
         | IsSymbolic, (I32 n, _) :: (I32 i, _) :: vs' ->
             let base = I64_convert.extend_i32_u i in
-            let _, v = Symmem2.load_bytes mem base (Int32.to_int n) in
+            let _, v = Heap.load_bytes mem base (Int32.to_int n) in
             let result = I32 (match v with Value _ -> 0l | _ -> 1l) in
             ((result, Value result) :: vs', [], pc, bp)
         | SetPriority, _ :: _ :: _ :: vs' -> (vs', [], pc, bp)
@@ -578,10 +568,6 @@ let rec step (c : config) : config =
     | SFrame (n, frame', (vs', { it = SReturning vs0; at } :: es')), vs ->
         (take n vs0 e.at @ vs, [], pc, bp)
     | SFrame (n, frame', code'), vs ->
-        if !Flags.smt_assume then (
-          let f (_, s) = (Logicenv.eval store s, s) in
-          List.iter (fun a -> a := f !a) frame.locals;
-          List.iter (fun a -> a := f !a) frame'.locals);
         let c' =
           step
             {
@@ -602,8 +588,8 @@ let rec step (c : config) : config =
         Exhaustion.error e.at "call stack exhausted"
     | SInvoke func, vs -> (
         let symbolic_arg t =
-          let x = Logicenv.next store "arg" in
-          let v = Logicenv.get store x t false in
+          let x = Store.next store "arg" in
+          let v = Store.get store x t false in
           (v, to_symbolic t x)
         in
         let (FuncType (ins, out)) = Func.type_of func in
@@ -666,17 +652,13 @@ let write_report spec reason witness loop_time : unit =
   Io.save_file (Filename.concat !Flags.output "report.json") report_str
 
 let update_config c model glob code mem =
-  let li32 = Logicenv.get_vars_by_type I32Type c.store
-  and li64 = Logicenv.get_vars_by_type I64Type c.store
-  and lf32 = Logicenv.get_vars_by_type F32Type c.store
-  and lf64 = Logicenv.get_vars_by_type F64Type c.store in
-  let binds = Z3Encoding2.lift_z3_model model li32 li64 lf32 lf64 in
-  Logicenv.reset c.store;
-  Logicenv.init c.store binds;
+  let binds = Encoding.lift model (Store.get_key_types c.store) in
+  Store.reset c.store;
+  Store.init c.store binds;
   Globals.clear c.glob;
   Globals.add_seq c.glob (Globals.to_seq glob);
-  Symmem2.clear c.mem;
-  Symmem2.add_seq c.mem (Symmem2.to_seq mem);
+  Heap.clear c.mem;
+  Heap.add_seq c.mem (Heap.to_seq mem);
   Hashtbl.reset c.heap;
   c.tree := head;
   {
@@ -688,7 +670,7 @@ let update_config c model glob code mem =
     budget = 100000;
   }
 
-module type Paths = sig
+module type Work_list = sig
   type 'a t
 
   exception Empty
@@ -699,56 +681,82 @@ module type Paths = sig
   val is_empty : 'a t -> bool
 end
 
-let invoke (c : config) (test_suite : string) =
-  let glob0 = Globals.copy c.glob
-  and code0 = c.code
-  and mem0 = Symmem2.memcpy c.mem in
-  let wl = Queue.create () in
-  let rec loop c =
-    let rec eval (c : config) : config =
-      match c.code with
-      | vs, [] -> c
-      | vs, { it = STrapping msg; at } :: _ -> Trap.error at msg
-      | vs, { it = Interrupt (AsmFail pc); at } :: _ ->
-          iterations := !iterations - 1;
-          { c with code = ([], []) }
-      | vs, { it = Interrupt i; at } :: es -> c
-      | vs, es ->
-          let c' = step c in
-          List.iter (fun pc -> if not (pc = []) then Queue.push pc wl) c'.bp;
-          eval { c' with bp = [] }
-    in
-    iterations := !iterations + 1;
-    let { code = _, es; store; bp; _ } = eval c in
-    List.iter (fun pc -> if not (pc = []) then Queue.push pc wl) bp;
-    let err =
-      match es with { it = Interrupt i; at } :: _ -> Some (i, at) | _ -> None
-    in
-    (*
-    let testcase = Logicenv.(to_json (to_list store)) in
-    write_test_case test_suite testcase (Option.is_some !err) test_cntr;
-    *)
-    if Option.is_some err then false
-    else if Queue.is_empty wl then true
-    else
-      let rec find_sat_pc pcs =
-        if Queue.is_empty pcs then None
-        else
-          match timed_check_sat (Formula.to_formulas (Queue.pop pcs)) with
-          | None -> find_sat_pc pcs
-          | Some m -> Some m
+module Guided_search (L : Work_list) = struct
+  let invoke (c : config) (test_suite : string) =
+    let cntr = count 0 in
+    let glob0 = Globals.copy c.glob
+    and code0 = c.code
+    and mem0 = Heap.memcpy c.mem in
+    let wl = L.create () in
+    let skip = ref false in
+    let rec loop c =
+      let rec eval (c : config) : config =
+        match c.code with
+        | vs, [] -> c
+        | vs, { it = STrapping msg; at } :: _ -> Trap.error at msg
+        | vs, { it = Interrupt (AsmFail pc); at } :: _ ->
+            skip := true;
+            iterations := !iterations - 1;
+            { c with code = ([], []) }
+        | vs, { it = Interrupt i; at } :: es -> c
+        | vs, es ->
+            let c' = step c in
+            List.iter (fun pc -> if not (pc = []) then L.push pc wl) c'.bp;
+            eval { c' with bp = [] }
       in
-      match find_sat_pc wl with
-      | None -> true
-      | Some m -> loop (update_config c m glob0 code0 mem0)
-  in
-  loop_start := Sys.time ();
-  let spec = loop c in
-  write_report spec "{}" "[]" (Sys.time () -. !loop_start)
+      skip := false;
+      iterations := !iterations + 1;
+      let { code = _, es; store; bp; _ } = eval c in
+      List.iter (fun pc -> if not (pc = []) then L.push pc wl) bp;
+      let err =
+        match es with
+        | { it = Interrupt i; at } :: _ -> Some (i, at)
+        | _ -> None
+      in
+      if not !skip then
+        write_test_case test_suite
+          Store.(to_json (to_list store))
+          (Option.is_some err) cntr;
+      if Option.is_some err then false
+      else if L.is_empty wl then true
+      else
+        let rec find_sat_pc pcs =
+          if L.is_empty pcs then None
+          else
+            match timed_check_sat (Formula.to_formulas (L.pop pcs)) with
+            | None -> find_sat_pc pcs
+            | Some m -> Some m
+        in
+        match find_sat_pc wl with
+        | None -> true
+        | Some m -> loop (update_config c m glob0 code0 mem0)
+    in
+    loop_start := Sys.time ();
+    let spec = loop c in
+    write_report spec "{}" "[]" (Sys.time () -. !loop_start)
+end
+
+module RandArray : Work_list = struct
+  type 'a t = 'a BatDynArray.t
+
+  exception Empty
+
+  let create () = BatDynArray.create ()
+  let is_empty a = BatDynArray.empty a
+  let push v a = BatDynArray.add a v
+
+  let pop a =
+    Random.self_init ();
+    BatDynArray.get a (Random.int (BatDynArray.length a))
+end
+
+module DFS = Guided_search (Stack)
+module BFS = Guided_search (Queue)
+module RND = Guided_search (RandArray)
 
 let set_timeout (time_limit : int) : unit =
   let alarm_handler i : unit =
-    Z3Encoding2.interrupt_z3 ();
+    Encoding.interrupt_z3 ();
     let loop_time = Sys.time () -. !loop_start in
     write_report true "{}" "[]" loop_time;
     exit 0
@@ -775,7 +783,14 @@ let main (func : func_inst) (vs : sym_value list) (inst : module_inst) =
       [ SInvoke func @@ at ]
       inst.sym_memory glob (ref head)
   in
-  invoke c test_suite
+  let f =
+    match parse_policy !Flags.policy with
+    | None -> Crash.error at ("invalid search policy '" ^ !Flags.policy ^ "'")
+    | Some Depth -> DFS.invoke
+    | Some Breadth -> BFS.invoke
+    | Some Random -> RND.invoke
+  in
+  f c test_suite
 
 let i32 (v : value) at =
   match v with
@@ -835,7 +850,7 @@ let init_memory (inst : module_inst) (seg : memory_segment) =
   let bound = Memory.bound mem in
   if I64.lt_u bound end_ || I64.lt_u end_ offset then
     Link.error seg.at "data segment does not fit memory";
-  fun () -> Symmem2.store_bytes sym_mem offset init
+  fun () -> Heap.store_bytes sym_mem offset init
 
 let add_import (m : module_) (ext : extern) (im : import) (inst : module_inst) :
     module_inst =

@@ -6,8 +6,6 @@ type size = int32
 type address = int64
 type offset = int32
 type store = int * sym_expr
-
-(*  Represents a symbolic memory  *)
 type memory = (address, store) Hashtbl.t
 type t = memory
 
@@ -224,11 +222,11 @@ let store_packed (sz : Memory.pack_size) (mem : memory) (a : address)
   in
   storen mem a o n (x, sx)
 
-let update (mem : memory) (store : Logicenv.t) : unit =
+let update (mem : memory) (store : Store.t) : unit =
   Hashtbl.iter
     (fun a (_, se) ->
       let i =
-        match Logicenv.eval store se with
+        match Store.eval store se with
         | I32 x -> Int32.to_int x
         | I64 x -> Int64.to_int x
         | F32 x -> Int32.to_int (F32.to_bits x)
