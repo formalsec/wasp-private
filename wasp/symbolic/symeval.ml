@@ -578,6 +578,10 @@ let rec step (c : config) : config =
     | SFrame (n, frame', (vs', { it = SReturning vs0; at } :: es')), vs ->
         (take n vs0 e.at @ vs, [], pc, bp)
     | SFrame (n, frame', code'), vs ->
+        if !Flags.smt_assume then (
+          let f (_, s) = (Logicenv.eval store s, s) in
+          List.iter (fun a -> a := f !a) frame.locals;
+          List.iter (fun a -> a := f !a) frame'.locals);
         let c' =
           step
             {
@@ -711,12 +715,12 @@ let invoke (c : config) (test_suite : string) =
       | vs, { it = Interrupt i; at } :: es -> c
       | vs, es ->
           let c' = step c in
-          eval c'
+          List.iter (fun pc -> if not (pc = []) then Queue.push pc wl) c'.bp;
+          eval { c' with bp = [] }
     in
     iterations := !iterations + 1;
     let { code = _, es; store; bp; _ } = eval c in
-    Queue.add_seq wl (List.to_seq bp);
-    print_int (Queue.length wl);
+    List.iter (fun pc -> if not (pc = []) then Queue.push pc wl) bp;
     let err =
       match es with { it = Interrupt i; at } :: _ -> Some (i, at) | _ -> None
     in
