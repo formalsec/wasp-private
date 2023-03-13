@@ -599,13 +599,12 @@ let get_reason (err_t, at) : string =
   "{" ^ "\"type\" : \"" ^ err_t ^ "\", " ^ "\"line\" : \"" ^ loc ^ "\"" ^ "}"
 
 let write_test_case ?(witness = false) out_dir test_data cnt : unit =
-  if not (test_data = "[]") then
-    let i = cnt () in
-    let filename =
-      if witness then Printf.sprintf "%s/witness_%05d.json" out_dir i
-      else Printf.sprintf "%s/test_%05d.json" out_dir i
-    in
-    Io.save_file filename test_data
+  let i = cnt () in
+  let filename =
+    if witness then Printf.sprintf "%s/witness_%05d.json" out_dir i
+    else Printf.sprintf "%s/test_%05d.json" out_dir i
+  in
+  Io.save_file filename test_data
 
 let write_report error loop_time : unit =
   let spec, reason =
