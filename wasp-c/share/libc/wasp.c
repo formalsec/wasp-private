@@ -29,7 +29,7 @@ int __WASP_is_symbolic(void *var, unsigned int sz) {
 }
 
 int __WASP_print_stack(int a) {
-
+  return 0;
 }
 
 void __WASP_print_pc() {
@@ -37,7 +37,7 @@ void __WASP_print_pc() {
 }
 
 /* special boolean ops */
-int __logand(int a, int b) {
+int and_(int a, int b) {
   __asm__ __volatile__(
     "local.get 0;"
     "i32.const 0;"
@@ -50,7 +50,7 @@ int __logand(int a, int b) {
   );
 }
 
-int __logor(int a, int b) {
+int or_(int a, int b) {
   __asm__ __volatile__(
     "local.get 0;"
     "i32.const 0;"
@@ -63,6 +63,6 @@ int __logor(int a, int b) {
   );
 }
 
-int __ternary(int cond, int a, int b) {
+int ite(int cond, int a, int b) {
   return cond ? a : b;
 }
