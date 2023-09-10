@@ -23,4 +23,4 @@
  (name waspc)
  (synopsis "")
  (description "")
- (depends ocaml dune core core_unix re2))
+ (depends ocaml dune re2 bos pyml cmdliner))

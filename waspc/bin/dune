@@ -5,8 +5,6 @@
  (libraries
   waspc
   re2
+  bos
   pyml
-  core
-  core_unix.command_unix
-  core_unix.filename_unix
-  core_unix.sys_unix))
+  cmdliner))
