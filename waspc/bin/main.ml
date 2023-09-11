@@ -1,13 +1,15 @@
 open Waspc
+open Bos
 
-let ( let* ) r f = match r with Error e -> failwith e | Ok v -> f v
+(* Just blowup for now, maybe bind later? *)
+let ( let* ) r f = match r with Error (`Msg e) -> failwith e | Ok v -> f v
 
-(* File processing for instrumentor.py *)
 let patterns : (Re2.t * string) array =
   Array.map
     (fun (regex, template) -> (Re2.create_exn regex, template))
-    [| ( "void reach_error\\(\\) \\{.*\\}"
+    [| ( "void\\s+reach_error\\(\\)\\s*\\{.*\\}"
        , "void reach_error() { __WASP_assert(0); }" )
+     ; ("void\\s+(assert|assume)\\(", "void old_\\1(")
     |]
 
 let patch_with_regex (file_data : string) : string =
@@ -21,70 +23,81 @@ let patch_gcc_ext (file_data : string) : string =
     ; "#define __extension__"
     ; "#define __restrict"
     ; "#define __inline"
+    ; "#include <wasp.h>"
+    ; "#include <assert.h>"
     ; file_data
     ]
 
-let instrument_file (file : string) (includes : string list) =
-  Log.debug "instrumenting ...\n";
-  match Sys.file_exists file with
-  | false -> Error (Format.sprintf "unable to read file \"%s\"@." file)
-  | true ->
-    let data =
-      In_channel.(with_open_text file input_all)
-      |> patch_gcc_ext |> patch_with_regex
-    in
+let instrument_file (file : Fpath.t) (includes : string list) =
+  Log.debug "instrumenting ...@.";
+  let* data = OS.File.read file in
+  let data = patch_gcc_ext data |> patch_with_regex in
+  try
     Py.initialize ();
-    let data = Instrumentor.process_text data file includes in
+    let data = Instrumentor.instrument data includes in
     Py.finalize ();
-    Ok data
+    data
+  with Py.E (err_type, _) as _e ->
+    Log.debug "      warning : exception \"%s\"@."
+      (Py.Object.to_string err_type);
+    data
 
-let compile_file (file : string) ~(includes : string list) =
-  Log.debug "compiling ...\n";
+let clang flags out_file file =
+  Cmd.(v "clang" %% flags % "-o" % p out_file % p file)
+
+let opt file = Cmd.(v "opt" % "-O1" % "-o" % p file % p file)
+
+let llc bc obj =
+  let flags = Cmd.of_list [ "-O1"; "-march=wasm32"; "-filetype=obj"; "-o" ] in
+  Cmd.(v "llc" %% flags % p obj % p bc)
+
+let ld flags out_file file =
+  let* ld_path = OS.Env.req_var "LD_PATH" in
+  let libc = Fpath.(v ld_path / "libc.wasm") in
+  Cmd.(v "wasm-ld" %% flags % "-o" % p out_file % p libc % p file)
+
+let wasm2wat file =
+  Cmd.(v "wasm2wat" % p file % "-o" % p (Fpath.set_ext ".wat" file))
+
+let compile_file (file : Fpath.t) ~(includes : string list) =
+  Log.debug "compiling     ...@.";
   let cflags =
-    String.concat " "
-      [ "-g"
-      ; "-emit-llvm"
-      ; "--target=wasm32"
-      ; "-m32"
-      ; String.concat " " @@ List.map (fun inc -> "-I" ^ inc) includes
-      ; "-c"
-      ]
+    let includes = Cmd.of_list ~slip:"-I" includes in
+    let warnings =
+      Cmd.of_list
+        [ "-Wno-implicit-function-declaration"
+        ; "-Wno-incompatible-library-redeclaration"
+        ]
+    in
+    Cmd.(
+      of_list [ "-g"; "-emit-llvm"; "--target=wasm32"; "-m32"; "-c" ]
+      %% warnings %% includes )
   in
-  let ldflags =
-    String.concat " "
-      [ "-z"
-      ; "stack-size=1073741824"
-      ; "--no-entry"
-      ; "--export=__original_main"
-      ]
+  let ldflags entry =
+    Cmd.(
+      of_list [ "-z"; "stack-size=1073741824"; "--no-entry" ]
+      % ("--export=" ^ entry) )
   in
-  let file_no_ext = Filename.chop_extension file in
-  let file_bc = file_no_ext ^ ".bc" in
-  let file_obj = file_no_ext ^ ".o" in
-  let file_wasm = file_no_ext ^ ".wasm" in
-  let _ =
-    Sys.command (Format.sprintf "clang %s -o %s %s" cflags file_bc file)
-  in
-  let _ = Sys.command (Format.sprintf "opt -O1 %s -o %s" file_bc file_bc) in
-  let _ =
-    Sys.command
-      (Format.sprintf "llc -O1 -march=wasm32 -filetype=obj %s -o %s" file_bc
-         file_obj )
-  in
-  (* TODO: get libc.wasm from LD_PATH *)
-  ignore
-  @@ Sys.command
-       (Format.sprintf "wasm-ld %s libc.wasm -o %s %s" file_obj file_wasm
-          ldflags )
+  let file_bc = Fpath.(file -+ ".bc") in
+  let file_obj = Fpath.(file -+ ".o") in
+  let file_wasm = Fpath.(file -+ ".wasm") in
+  let* _ = OS.Cmd.run @@ clang cflags file_bc file in
+  let* _ = OS.Cmd.run @@ opt file_bc in
+  let* _ = OS.Cmd.run @@ llc file_bc file_obj in
+  let* _ = OS.Cmd.run @@ ld (ldflags "__original_main") file_wasm file_obj in
+  let* _ = OS.Cmd.run @@ wasm2wat file_wasm in
+  ()
 
 let main debug output includes files =
   Log.on_debug := debug;
-  if not @@ Sys.file_exists output then Unix.mkdir output 0o755;
+  let output = Fpath.v output in
+  let* _ = OS.Dir.create output in
   List.iter
     (fun file ->
-      let* data = instrument_file file includes in
-      let filename = Filename.concat output "instrumented.c" in
-      Out_channel.(with_open_text filename (fun t -> output_string t data));
+      let* file = OS.File.must_exist (Fpath.v file) in
+      let data = instrument_file file includes in
+      let filename = Fpath.(output / "instrumented.c") in
+      let* _ = OS.File.write filename data in
       compile_file filename ~includes )
     files
 

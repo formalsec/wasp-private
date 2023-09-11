@@ -10,9 +10,10 @@ bug-reports: "https://github.com/wasp-platform/wasp/issues"
 depends: [
   "ocaml"
   "dune" {>= "3.0"}
-  "core"
-  "core_unix"
   "re2"
+  "bos"
+  "pyml"
+  "cmdliner"
   "odoc" {with-doc}
 ]
 build: [

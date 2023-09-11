@@ -21,7 +21,10 @@ double __WASP_symb_double(char *name) {
 }
 
 /* symbolic variable manipulation */
+#ifndef assume
 void assume(int expr) { return __WASP_assume(expr); }
+#endif
+
 void __WASP_assume(int expr) { }
 void __WASP_assert(int expr) { }
 int __WASP_is_symbolic(void *var, unsigned int sz) {

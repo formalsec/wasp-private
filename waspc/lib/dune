@@ -1,3 +1,4 @@
 (library
  (name waspc)
- (modules log))
+ (modules log instrumentor)
+ (libraries pyml))
