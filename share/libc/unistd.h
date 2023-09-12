@@ -3,8 +3,12 @@
 
 #include <sys/types.h>
 
-int open(const char* pathname,int flags, ...);
+extern int optind, opterr, optopt;
+extern char *optarg;
+/* int getopt(int argc, char *const argv[], const char *options); */
+
+/* int open(const char* pathname,int flags, ...); */
 int close(int fd);
-ssize_t read(int fd,void* buf,size_t len);
+ssize_t read(int fd, void *buf, size_t len);
 
 #endif
