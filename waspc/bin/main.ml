@@ -9,6 +9,7 @@ let patterns : (Re2.t * string) array =
     (fun (regex, template) -> (Re2.create_exn regex, template))
     [| ( "void\\s+reach_error\\(\\)\\s*\\{.*\\}"
        , "void reach_error() { __WASP_assert(0); }" )
+       (* ugly: Hack to solve duplicate errors on compilation *)
      ; ("void\\s+(assert|assume)\\(", "void old_\\1(")
     |]
 
@@ -65,8 +66,13 @@ let compile_file (file : Fpath.t) ~(includes : string list) =
     let includes = Cmd.of_list ~slip:"-I" includes in
     let warnings =
       Cmd.of_list
-        [ "-Wno-implicit-function-declaration"
+        [ "-Wno-int-conversion"
+        ; "-Wno-pointer-sign"
+        ; "-Wno-string-plus-int"
+        ; "-Wno-implicit-function-declaration"
         ; "-Wno-incompatible-library-redeclaration"
+        ; "-Wno-incompatible-function-pointer-types"
+        ; "-Wno-incompatible-pointer-types"
         ]
     in
     Cmd.(
