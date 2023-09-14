@@ -120,17 +120,18 @@ let compile_file (file : Fpath.t) ~(includes : string list) =
   let* _ = OS.Cmd.run @@ wasm2wat file_wasm file_wat in
   file_wat
 
-let run_file _file output =
+let run_file file output =
   Log.debug "      running2 ...@.";
   (* Set flags in the reference interpreter *)
   Interpreter.Flags.trace := true;
   Interpreter.Flags.output := Fpath.to_string output;
   (* Create command sequence for reference interpreter *)
   let cmds =
-    [ (* Format.sprintf "(input \"%s\")" (Fpath.to_string file) *)
-      (* ; Format.sprintf "(invoke \"__original_main\")" *) ]
+    [ Format.sprintf "(input \"%s\")" (Fpath.to_string file)
+    ; Format.sprintf "(invoke \"__original_main\")"
+    ]
   in
-  List.iter (fun cmd -> if not @@ Wasp.Run.run_string_ce cmd then exit 1) cmds
+  List.iter (fun cmd -> if not @@ Wasp.Run.run_string_se cmd then exit 1) cmds
 
 let main debug output includes files =
   Log.on_debug := debug;
